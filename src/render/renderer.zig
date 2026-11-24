@@ -90,7 +90,18 @@ pub const Gpu = struct {
     pub fn makeCurrent(self: *Gpu) !void {
         try self.device.display.makeCurrent(null, null, self.context);
     }
+
+    /// Unbind our context from this thread, so a toolkit sharing the thread
+    /// (GTK) finds no context current rather than ours.
+    pub fn release(self: *Gpu) void {
+        self.device.display.releaseCurrent();
+    }
 };
+
+/// How many targets a renderer rotates through. A finished frame may still
+/// be on screen (as a DMA-BUF) while the next ones draw, as in Ghostty's
+/// swap chain.
+pub const swap_chain_count = 3;
 
 pub const Options = struct {
     /// Padding around the grid, in device pixels.
@@ -116,7 +127,8 @@ pub const Renderer = struct {
     focused: bool = true,
 
     // GPU resources, created on first draw.
-    target: ?ogl.Target = null,
+    targets: [swap_chain_count]?ogl.Target = @splat(null),
+    target_index: usize = 0,
     uniforms_buf: ?ogl.buffer.Buffer(shaders.Uniforms) = null,
     bg_buf: ?ogl.buffer.Buffer(shaders.CellBg) = null,
     fg_buf: ?ogl.buffer.Buffer(shaders.CellText) = null,
@@ -162,7 +174,7 @@ pub const Renderer = struct {
 
     pub fn deinit(self: *Renderer) void {
         self.gpu.makeCurrent() catch {};
-        if (self.target) |*t| t.deinit();
+        for (&self.targets) |*maybe| if (maybe.*) |*t| t.deinit();
         if (self.uniforms_buf) |b| b.deinit();
         if (self.bg_buf) |b| b.deinit();
         if (self.fg_buf) |b| b.deinit();
@@ -532,12 +544,15 @@ pub const Renderer = struct {
         std.debug.assert(width > 0 and height > 0);
 
         // (Re)create the target at the right size.
-        if (self.target) |*t| if (t.width != width or t.height != height) {
+        // Take the next target in the rotation, (re)creating it at this size.
+        self.target_index = (self.target_index + 1) % swap_chain_count;
+        const slot = &self.targets[self.target_index];
+        if (slot.*) |*t| if (t.width != width or t.height != height) {
             t.deinit();
-            self.target = null;
+            slot.* = null;
         };
-        if (self.target == null) self.target = try ogl.Target.init(.{ .width = width, .height = height });
-        const target = &self.target.?;
+        if (slot.* == null) slot.* = try ogl.Target.init(.{ .width = width, .height = height });
+        const target = &slot.*.?;
 
         // Ghostty sets this from its surface code; RenderPass doesn't.
         try gl.viewport(0, 0, @intCast(width), @intCast(height));

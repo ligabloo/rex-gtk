@@ -15,9 +15,21 @@ sudo moss install zig pkgconf glibc-devel gtk-4-devel libadwaita-devel graphene-
 ```
 
 ```sh
-zig build run     # run the app
-zig build test    # unit tests (no display needed)
+zig build run                                  # run the app
+zig build run -- --session work --font "JetBrains Mono" --font-size 12
+zig build test                                 # unit tests (no display needed)
 ```
+
+Options: `--session ID|LABEL` picks the session to show (otherwise the server picks one),
+`--font`/`--font-size` set the terminal font, `--label` names this client for
+`rex -C LABEL …`, and `--dump-frame PATH` writes every frame to a PNG for debugging.
+
+## Tools
+
+- `rexcat BLOCK [--follow MS] [--record FILE]`: attach to a terminal headlessly and print it;
+  `--record` saves the raw data stream.
+- `rexshot RECORDING OUT.png`: render a recording with the GPU renderer, no display needed.
+- `fontcheck [FAMILY] [SIZE]`: load the terminal font and rasterize sample glyphs.
 
 ## Protocol reference
 

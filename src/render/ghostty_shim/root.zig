@@ -12,6 +12,8 @@ pub const global = @import("global.zig");
 pub const config = @import("config.zig");
 pub const math = @import("math.zig");
 pub const nerd_font_attributes = @import("font/nerd_font_attributes.zig");
+/// Native keycodes (xkb on Linux) to W3C key codes, from Chromium via Ghostty.
+pub const keycodes = @import("input/keycodes.zig");
 /// Ghostty's Zig bindings for OpenGL (glad) and EGL.
 pub const gl = @import("opengl");
 

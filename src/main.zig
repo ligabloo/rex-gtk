@@ -1,35 +1,52 @@
-const std = @import("std");
-const adw = @import("adw");
-const gio = @import("gio");
-const gtk = @import("gtk");
+//! rex-gtk: a GTK client for Rex.
+//!
+//!   rex-gtk [--session ID|LABEL] [--font FAMILY] [--font-size POINTS] [--label LABEL]
 
-const app_id = "dev.ligabloo.RexGtk";
+const std = @import("std");
+const core = @import("core");
+const render = @import("render");
+const app_mod = @import("ui/app.zig");
+const App = app_mod.App;
+
+const usage =
+    \\usage: rex-gtk [--session ID|LABEL] [--font FAMILY] [--font-size POINTS] [--label LABEL]
+    \\
+;
 
 pub fn main(init: std.process.Init) !u8 {
-    _ = init;
-    const app = adw.Application.new(app_id, .{});
-    defer app.unref();
+    const gpa = init.gpa;
+    const io = init.io;
+    // Ghostty's font code reads the process's I/O and environment.
+    render.ghostty.global.init(io, init.minimal.environ);
 
-    _ = gio.Application.signals.activate.connect(app, ?*anyopaque, &onActivate, null, .{});
+    var options: app_mod.Options = .{};
+    {
+        var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
+        _ = args.skip();
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--session")) {
+                options.session = args.next() orelse return fail(usage);
+            } else if (std.mem.eql(u8, arg, "--font")) {
+                options.font_family = args.next() orelse return fail(usage);
+            } else if (std.mem.eql(u8, arg, "--font-size")) {
+                options.font_size = std.fmt.parseFloat(f32, args.next() orelse return fail(usage)) catch return fail(usage);
+            } else if (std.mem.eql(u8, arg, "--dump-frame")) {
+                options.dump_frame = args.next() orelse return fail(usage);
+            } else if (std.mem.eql(u8, arg, "--label")) {
+                options.label = args.next() orelse return fail(usage);
+            } else return fail(usage);
+        }
+    }
 
-    const status = gio.Application.run(app.as(gio.Application), 0, null);
-    return @intCast(status);
+    const socket_path = try core.control.defaultSocketPath(gpa, init.environ_map);
+    defer gpa.free(socket_path);
+
+    const app = try App.create(gpa, io, socket_path, options);
+    defer app.destroy();
+    return app.run();
 }
 
-fn onActivate(app: *adw.Application, _: ?*anyopaque) callconv(.c) void {
-    const window = adw.ApplicationWindow.new(app.as(gtk.Application));
-    window.as(gtk.Window).setTitle("Rex");
-    window.as(gtk.Window).setDefaultSize(1000, 700);
-
-    const status = adw.StatusPage.new();
-    status.setIconName("utilities-terminal-symbolic");
-    status.setTitle("Rex");
-    status.setDescription("Not connected yet");
-
-    const toolbar = adw.ToolbarView.new();
-    toolbar.addTopBar(adw.HeaderBar.new().as(gtk.Widget));
-    toolbar.setContent(status.as(gtk.Widget));
-
-    window.setContent(toolbar.as(gtk.Widget));
-    window.as(gtk.Window).present();
+fn fail(msg: []const u8) u8 {
+    std.debug.print("{s}", .{msg});
+    return 2;
 }

@@ -145,6 +145,7 @@ const ghostty_files = [_][]const u8{
     "renderer/row.zig",
     "renderer/cursor.zig",
     "renderer/Dmabuf.zig",
+    "input/keycodes.zig",
 };
 const shim_files = [_][]const u8{
     "root.zig",
@@ -153,6 +154,7 @@ const shim_files = [_][]const u8{
     "build_config.zig",
     "renderer.zig",
     "renderer/OpenGL.zig",
+    "input/key.zig",
     "terminal/main.zig",
     "terminal/size.zig",
     "os/main.zig",
