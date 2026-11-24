@@ -1,0 +1,17 @@
+.{
+    .name = .rex_gtk,
+    .version = "0.0.1",
+    .dependencies = .{
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/74d1983f27eb004ef442c8353bd703eba19c93b6.tar.gz",
+            .hash = "ghostty-1.4.1-dev-5UdBC5lRpwU0IBJN3sYLcr6jP2Lf07tFeqONdE5bvAH6",
+        },
+        .gobject = .{
+            .url = "https://deps.files.ghostty.org/gobject-2026-10-02-38-1.tar.zst",
+            .hash = "gobject-0.3.2-Skun7LuIogBbEh-6WrLeEzMaRCnOMB3eOf__RaPYSMCZ",
+        },
+    },
+    .minimum_zig_version = "0.17.1",
+    .paths = .{""},
+    .fingerprint = 0x38c5ede8e92dfdcf,
+}
