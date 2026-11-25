@@ -1,11 +1,11 @@
 //! The content's header bar, in the two layouts:
 //!
 //! - Tabs in the sidebar (the default): the sidebar toggle, the tab's name
-//!   over "session · machine", New Tab. The bar can hide, and slides in
+//!   over "session · machine". The bar can hide, and slides in
 //!   over the terminal when the pointer reaches the top edge, like Black
 //!   Box.
 //! - Tabs in the header bar: a session switcher (session over machine)
-//!   that opens a popover of every machine's sessions, the tabs, New Tab.
+//!   that opens a popover of every machine's sessions, and the tabs.
 //!   There is no sidebar.
 //!
 //! Settings: "tabs.layout" is "sidebar" or "header"; "header.behavior" is
@@ -40,8 +40,6 @@ pub const Header = struct {
     split: *adw.OverlaySplitView,
     /// The palette button, at the end.
     end_box: *gtk.Box,
-    /// Only in the header bar layout: the sidebar has its own.
-    new_tab: *gtk.Button,
     layout: Layout = .sidebar,
     behavior: Behavior = .hover,
     hovering: bool = false,
@@ -98,20 +96,14 @@ pub const Header = struct {
         switcher.as(gtk.Widget).addCssClass("flat");
         bar.packStart(switcher.as(gtk.Widget));
 
-        // The palette, beside New Tab while the sidebar (which has its own)
-        // is hidden.
+        // The palette while the sidebar (which has its own) is hidden.
         const end_box = gtk.Box.new(.horizontal, 6);
         const palette = gtk.Button.newFromIconName("modifier-key-symbolic");
         palette.as(gtk.Widget).setTooltipText("Command Palette");
         palette.as(gtk.Actionable).setActionName("app.rex");
         palette.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.palette.toggle"));
         end_box.append(palette.as(gtk.Widget));
-        const new_tab = gtk.Button.newFromIconName("tab-new-symbolic");
-        new_tab.as(gtk.Widget).setTooltipText("New Tab");
-        new_tab.as(gtk.Actionable).setActionName("app.rex");
-        new_tab.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.tab.new"));
         bar.packEnd(end_box.as(gtk.Widget));
-        bar.packEnd(new_tab.as(gtk.Widget));
 
         const tab_bar = adw.TabBar.new();
         tab_bar.setAutohide(0);
@@ -145,7 +137,6 @@ pub const Header = struct {
             .content = content,
             .split = split,
             .end_box = end_box,
-            .new_tab = new_tab,
         };
 
         _ = gobject.Object.signals.notify.connect(split, *Header, &onSidebarShown, self, .{ .detail = "show-sidebar" });
@@ -178,7 +169,6 @@ pub const Header = struct {
         const header_tabs = self.layout == .header;
         self.toggle.as(gtk.Widget).setVisible(@intFromBool(!header_tabs));
         self.switcher.as(gtk.Widget).setVisible(@intFromBool(header_tabs));
-        self.new_tab.as(gtk.Widget).setVisible(@intFromBool(header_tabs));
         self.bar.setTitleWidget(if (header_tabs) self.tab_bar.as(gtk.Widget) else self.title.as(gtk.Widget));
         if (header_tabs) {
             self.split.setShowSidebar(0);

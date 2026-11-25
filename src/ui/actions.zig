@@ -157,7 +157,7 @@ pub fn perform(app: *App, name: []const u8, args: std.json.Value) Error!void {
 
     // Tabs.
     if (eq(u8, name, "client.tab.new")) {
-        return rex.send("session.new_window", .{ .session_id = sid, .layout = shellLayout(app) });
+        return newTabOn(app, view.machine, sid);
     }
     if (eq(u8, name, "client.tab.next")) return rex.send("session.focus_next_window", .{ .session_id = sid, .wrap = true });
     if (eq(u8, name, "client.tab.previous")) return rex.send("session.focus_previous_window", .{ .session_id = sid, .wrap = true });
@@ -178,7 +178,7 @@ pub fn perform(app: *App, name: []const u8, args: std.json.Value) Error!void {
     }
 
     const tab = view.selectedTab() orelse return error.NoTarget;
-    if (eq(u8, name, "client.tab.close")) return rex.send("session.close_window", .{ .session_id = sid, .window_id = tab.window_id });
+    if (eq(u8, name, "client.tab.close")) return view.closeTab(tab);
     if (eq(u8, name, "client.tab.rename")) return promptRename(app, .tab, tab.label orelse "", "Rename Tab");
 
     // Panes.
@@ -292,6 +292,17 @@ const ShellLayout = struct {
         options: ShellOptions = .{},
     } = .{},
 };
+
+pub fn newTabOn(app: *App, m: *Machine, session_id: []const u8) void {
+    const current = if (app.view) |view|
+        view.machine == m and std.mem.eql(u8, view.session_id, session_id)
+    else
+        false;
+    m.send("session.new_window", .{
+        .session_id = session_id,
+        .layout = if (current) shellLayout(app) else ShellLayout{},
+    });
+}
 
 /// A new shell, started in the focused pane's directory when we know it.
 fn shellLayout(app: *App) ShellLayout {

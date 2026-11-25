@@ -323,6 +323,17 @@ pub const SessionView = struct {
         return if (index < self.tabs.items.len) self.tabs.items[index] else null;
     }
 
+    pub fn closeTab(self: *SessionView, tab: *const Tab) void {
+        if (self.tabs.items.len == 1) {
+            self.machine.send("session.destroy", .{ .session_id = self.session_id });
+            return;
+        }
+        self.machine.send("session.close_window", .{
+            .session_id = self.session_id,
+            .window_id = tab.window_id,
+        });
+    }
+
     fn findTab(self: *SessionView, window_id: []const u8) ?*Tab {
         for (self.tabs.items) |t| if (std.mem.eql(u8, t.window_id, window_id)) return t;
         return null;
@@ -620,12 +631,8 @@ pub const SessionView = struct {
 
     fn onClosePage(view: *adw.TabView, page: *adw.TabPage, self: *SessionView) callconv(.c) c_int {
         if (self.syncing) return 0; // we're removing it: let it close
-        // The user closed a tab: close the window on the server. The tab
-        // goes away when the view without it arrives.
-        if (self.tabForPage(page)) |tab| self.machine.send("session.close_window", .{
-            .session_id = self.session_id,
-            .window_id = tab.window_id,
-        });
+        // Leave the tab in place until the server reports the change.
+        if (self.tabForPage(page)) |tab| self.closeTab(tab);
         view.closePageFinish(page, 0);
         return 1;
     }

@@ -1,6 +1,6 @@
 //! The sidebar: every machine, its sessions, and each session's tabs, as
 //! in Rex.app. A machine heading (with New Session, or a warning when it
-//! can't be reached), a small session heading, then a row per tab with a
+//! can't be reached), a session heading with New Tab, then a row per tab with a
 //! tile, the tab's name and its working directory.
 //!
 //! The list is rebuilt from the machines' overviews whenever they change,
@@ -50,14 +50,8 @@ pub const Sidebar = struct {
     pub fn init(self: *Sidebar, app: *App) void {
         const gpa = app.gpa;
 
-        // Header: New Tab, with the title centered.
         const header = adw.HeaderBar.new();
         header.setTitleWidget(adw.WindowTitle.new("Sessions", "").as(gtk.Widget));
-        const new_tab = gtk.Button.newFromIconName("tab-new-symbolic");
-        new_tab.as(gtk.Widget).setTooltipText("New Tab");
-        new_tab.as(gtk.Actionable).setActionName("app.rex");
-        new_tab.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.tab.new"));
-        header.packEnd(new_tab.as(gtk.Widget));
         const palette = gtk.Button.newFromIconName("modifier-key-symbolic");
         palette.as(gtk.Widget).setTooltipText("Command Palette");
         palette.as(gtk.Actionable).setActionName("app.rex");
@@ -162,7 +156,7 @@ pub const Sidebar = struct {
             for (m.sessions.items) |s| {
                 const sid = a.dupe(u8, s.session_id) catch continue;
                 const name = if (s.label.len > 0) s.label else shortId(s.session_id);
-                self.append(sessionRow(name, machine_collapsed or self.collapsed_sessions.contains(sid)), .{
+                self.append(self.sessionRow(name, machine_collapsed or self.collapsed_sessions.contains(sid)), .{
                     .kind = .session,
                     .machine = m,
                     .session_id = sid,
@@ -250,7 +244,7 @@ pub const Sidebar = struct {
         return row;
     }
 
-    fn sessionRow(name: []const u8, collapsed: bool) *gtk.ListBoxRow {
+    fn sessionRow(self: *Sidebar, name: []const u8, collapsed: bool) *gtk.ListBoxRow {
         const row = gtk.ListBoxRow.new();
         row.setSelectable(0);
         row.as(gtk.Widget).addCssClass("session-row");
@@ -264,6 +258,11 @@ pub const Sidebar = struct {
         label.as(gtk.Widget).addCssClass("heading");
         label.as(gtk.Widget).addCssClass("dim-label");
         box.append(label.as(gtk.Widget));
+        const new_tab = gtk.Button.newFromIconName("tab-new-symbolic");
+        new_tab.as(gtk.Widget).addCssClass("flat");
+        new_tab.as(gtk.Widget).setTooltipText("New Tab");
+        _ = gtk.Button.signals.clicked.connect(new_tab, *Sidebar, &onNewTab, self, .{});
+        box.append(new_tab.as(gtk.Widget));
         const expander = gtk.Image.newFromIconName(if (collapsed) "pan-end-symbolic" else "pan-down-symbolic");
         expander.as(gtk.Widget).addCssClass("expander");
         box.append(expander.as(gtk.Widget));
@@ -345,6 +344,16 @@ pub const Sidebar = struct {
     fn onNewSession(_: *gtk.Button, m: *Machine) callconv(.c) void {
         const app: *App = @ptrCast(@alignCast(m.listener.ctx));
         @import("actions.zig").newSessionOn(app, m);
+    }
+
+    fn onNewTab(button: *gtk.Button, self: *Sidebar) callconv(.c) void {
+        const box = button.as(gtk.Widget).getParent() orelse return;
+        const widget = box.getParent() orelse return;
+        const row = gobject.ext.cast(gtk.ListBoxRow, widget) orelse return;
+        const index = std.math.cast(usize, row.getIndex()) orelse return;
+        if (index >= self.entries.items.len) return;
+        const entry = self.entries.items[index];
+        @import("actions.zig").newTabOn(self.app, entry.machine, entry.session_id);
     }
 
     fn onRetry(_: *gtk.Button, m: *Machine) callconv(.c) void {
