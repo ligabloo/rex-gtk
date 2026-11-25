@@ -128,6 +128,13 @@ pub const Conn = struct {
         };
         errdefer stream.close(io);
 
+        // Keystrokes are small, separately flushed WebSocket messages.
+        // Send them without waiting for earlier TCP segments to be acked.
+        const nodelay: c_int = 1;
+        std.posix.setsockopt(stream.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&nodelay)) catch |err| {
+            log.debug("setting TCP_NODELAY failed: {}", .{err});
+        };
+
         const self = try gpa.create(Conn);
         errdefer gpa.destroy(self);
         self.* = .{

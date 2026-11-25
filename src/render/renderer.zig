@@ -212,11 +212,26 @@ pub const Renderer = struct {
 
     /// Read the terminal and rebuild what changed. Cheap when nothing did.
     pub fn update(self: *Renderer, t: *vt.Terminal, cursor_blink_visible: bool) !void {
+        const previous_cursor = self.state.cursor.viewport;
         try self.state.update(self.gpa, t);
-        defer self.state.dirty = .false;
-        if (self.state.dirty == .false) return;
 
-        try self.rebuildCells(rp.cursorStyle(&self.state, .{
+        // Shaping can break ligatures at the cursor. Refresh both affected
+        // rows when it moves, even if the terminal text didn't change.
+        const cursor = self.state.cursor.viewport;
+        if (!std.meta.eql(previous_cursor, cursor)) {
+            const dirty = self.state.row_data.items(.dirty);
+            if (previous_cursor) |pos| {
+                if (pos.y < dirty.len) dirty[pos.y] = true;
+            }
+            if (cursor) |pos| dirty[pos.y] = true;
+            if (self.state.dirty == .false) self.state.dirty = .partial;
+        }
+
+        if (self.state.dirty != .false) {
+            try self.rebuildCells();
+            self.state.dirty = .false;
+        }
+        self.updateCursor(rp.cursorStyle(&self.state, .{
             .focused = self.focused,
             .blink_visible = cursor_blink_visible,
         }));
@@ -230,7 +245,7 @@ pub const Renderer = struct {
         self.state.dirty = .full;
     }
 
-    fn rebuildCells(self: *Renderer, cursor_style_: ?rp.CursorStyle) Allocator.Error!void {
+    fn rebuildCells(self: *Renderer) Allocator.Error!void {
         const state = &self.state;
 
         const grid_size_diff =
@@ -272,36 +287,36 @@ pub const Renderer = struct {
                 self.cells.clear(y);
             };
         }
-
-        // Cursor.
-        cursor: {
-            self.cells.setCursor(null, null);
-            self.uniforms.cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
-            const cursor_vp = state.cursor.viewport orelse break :cursor;
-            const style = cursor_style_ orelse break :cursor;
-            const cursor_color = state.colors.cursor orelse state.colors.foreground;
-            self.addCursor(&state.cursor, style, cursor_color);
-
-            if (style == .block) {
-                const wide = state.cursor.cell.wide;
-                self.uniforms.cursor_pos = .{
-                    switch (wide) {
-                        .narrow, .spacer_head, .wide => cursor_vp.x,
-                        .spacer_tail => cursor_vp.x -| 1,
-                    },
-                    @intCast(cursor_vp.y),
-                };
-                self.uniforms.bools.cursor_wide = switch (wide) {
-                    .narrow, .spacer_head => false,
-                    .wide, .spacer_tail => true,
-                };
-                // Text under a block cursor takes the background color.
-                const bg = state.colors.background;
-                self.uniforms.cursor_color = .{ bg.r, bg.g, bg.b, 255 };
-            }
-        }
-
         self.cells_rebuilt = true;
+    }
+
+    /// Cursor state can change independently of text rows.
+    fn updateCursor(self: *Renderer, cursor_style: ?rp.CursorStyle) void {
+        const state = &self.state;
+        self.cells.setCursor(null, null);
+        self.uniforms.cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
+        const cursor_vp = state.cursor.viewport orelse return;
+        const style = cursor_style orelse return;
+        const cursor_color = state.colors.cursor orelse state.colors.foreground;
+        self.addCursor(&state.cursor, style, cursor_color);
+
+        if (style == .block) {
+            const wide = state.cursor.cell.wide;
+            self.uniforms.cursor_pos = .{
+                switch (wide) {
+                    .narrow, .spacer_head, .wide => cursor_vp.x,
+                    .spacer_tail => cursor_vp.x -| 1,
+                },
+                @intCast(cursor_vp.y),
+            };
+            self.uniforms.bools.cursor_wide = switch (wide) {
+                .narrow, .spacer_head => false,
+                .wide, .spacer_tail => true,
+            };
+            // Text under a block cursor takes the background color.
+            const bg = state.colors.background;
+            self.uniforms.cursor_color = .{ bg.r, bg.g, bg.b, 255 };
+        }
     }
 
     fn rebuildRow(
@@ -568,10 +583,12 @@ pub const Renderer = struct {
         if (self.bg_buf == null) self.bg_buf = try .init(opts, 1);
         if (self.fg_buf == null) self.fg_buf = try .init(opts, 1);
         try self.uniforms_buf.?.sync(&.{self.uniforms});
-        try self.bg_buf.?.sync(self.cells.bg_cells);
+        if (self.cells_rebuilt) {
+            try self.bg_buf.?.sync(self.cells.bg_cells);
+            self.cells_rebuilt = false;
+        }
         const fg_count = try self.fg_buf.?.syncFromArrayLists(self.cells.fg_rows);
         log.debug("draw {}x{}: {} glyph instances, {} bg cells", .{ width, height, fg_count, self.cells.bg_cells.len });
-        self.cells_rebuilt = false;
 
         try self.syncAtlas(&self.fonts.grid.atlas_grayscale, &self.grayscale, &self.grayscale_modified);
         try self.syncAtlas(&self.fonts.grid.atlas_color, &self.color, &self.color_modified);

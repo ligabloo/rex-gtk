@@ -694,7 +694,6 @@ pub const Pane = struct {
         self.focused = true;
         self.im.as(gtk.IMContext).focusIn();
         self.renderer.focused = true;
-        self.renderer.invalidate();
         self.restartBlink();
         self.sendFocus("in");
         self.markDirty();
@@ -739,7 +738,6 @@ pub const Pane = struct {
         self.im.as(gtk.IMContext).focusOut();
         self.pressed.clearRetainingCapacity();
         self.renderer.focused = false;
-        self.renderer.invalidate();
         if (self.blink_id != 0) _ = glib.Source.remove(self.blink_id);
         self.blink_id = 0;
         self.blink_visible = true;
@@ -761,20 +759,14 @@ pub const Pane = struct {
         const was_visible = self.blink_visible;
         self.blink_visible = true;
         self.blink_id = glib.timeoutAdd(blink_interval_ms, &onBlink, self);
-        if (!was_visible) {
-            self.renderer.invalidate();
-            self.markDirty();
-        }
+        if (!was_visible) self.markDirty();
     }
 
     fn onBlink(data: ?*anyopaque) callconv(.c) c_int {
         const self: *Pane = @ptrCast(@alignCast(data.?));
         self.blink_visible = !self.blink_visible;
         const blinking = if (self.mirror) |m| m.terminal.modes.get(.cursor_blinking) else false;
-        if (blinking) {
-            self.renderer.invalidate();
-            self.markDirty();
-        }
+        if (blinking) self.markDirty();
         return 1; // keep going
     }
 };
