@@ -490,8 +490,24 @@ pub const SessionView = struct {
     }
 
     fn focusedTitle(self: *SessionView, tab: *Tab) ?[]const u8 {
-        const pane = self.focusedPane(tab) orelse return null;
-        return pane.title;
+        if (self.focusedPane(tab)) |pane| if (pane.title) |t| return t;
+        // A title set before we attached only reached the overview.
+        const id = tab.focused_block_id orelse return null;
+        const info = self.machine.overview.block(id) orelse return null;
+        return info.title;
+    }
+
+    /// Show the tab of a window, as from the sidebar.
+    pub fn selectWindow(self: *SessionView, window_id: []const u8) void {
+        const tab = self.findTab(window_id) orelse return;
+        // Our page signal sends session.focus_window.
+        self.tab_view.setSelectedPage(tab.page);
+    }
+
+    /// The selected tab's name, as the sidebar shows it.
+    pub fn activeTabTitle(self: *SessionView) ?[]const u8 {
+        const tab = self.selectedTab() orelse return null;
+        return @import("overview.zig").tabTitle(tab.label orelse "", self.focusedTitle(tab));
     }
 
     /// The title of the focused pane in the selected tab.
@@ -757,6 +773,11 @@ pub const SessionView = struct {
         const self: *SessionView = @ptrCast(@alignCast(ctx));
         if (self.blocks.get(pane.block_id) == null) return;
         self.requestTicket(pane.block_id);
+    }
+
+    /// Titles we take from the overview changed.
+    pub fn titlesChanged(self: *SessionView) void {
+        for (self.tabs.items) |tab| self.updateTabTitle(tab);
     }
 
     fn onPaneTitle(ctx: *anyopaque, _: *Pane) void {

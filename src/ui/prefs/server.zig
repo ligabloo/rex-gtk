@@ -399,7 +399,7 @@ pub const ServerPage = struct {
 
     fn stopServer(self: *ServerPage, restart: bool) void {
         self.outstanding += 1;
-        self.local().call("server.stop", .{}, self, if (restart) &onStoppedRestart else &onStopped);
+        self.local().call("server.stop", null, self, if (restart) &onStoppedRestart else &onStopped);
     }
 
     fn onStopped(ctx: ?*anyopaque, msg: ?Incoming) void {
@@ -481,7 +481,7 @@ pub const ServerPage = struct {
 
     fn onServeToggled(row: *adw.SwitchRow, _: *gobject.ParamSpec, self: *ServerPage) callconv(.c) void {
         if (self.building) return;
-        if (row.getActive() != 0) self.enable() else self.tailscaleCall("server.tailscale.disable", .{});
+        if (row.getActive() != 0) self.enable() else self.tailscaleCall("server.tailscale.disable", null);
     }
 
     fn onOnlyMineToggled(_: *adw.SwitchRow, _: *gobject.ParamSpec, self: *ServerPage) callconv(.c) void {
@@ -512,7 +512,7 @@ pub const ServerPage = struct {
     fn onSignInClicked(_: *gtk.Button, self: *ServerPage) callconv(.c) void {
         if (self.currentTailscale()) |st| if (st.auth_url) |url| return win.openUri(self.prefs, url);
         self.outstanding += 1;
-        self.local().call("server.tailscale.login", .{}, self, &onLogin);
+        self.local().call("server.tailscale.login", null, self, &onLogin);
     }
 
     fn onLogin(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
@@ -529,7 +529,7 @@ pub const ServerPage = struct {
         win.confirm(self.prefs, "Sign Out of Tailscale?", "This server leaves your tailnet, and your other devices can't reach it until you sign in again.", "Sign Out", self, &struct {
             fn go(ctx: *anyopaque) void {
                 const s: *ServerPage = @ptrCast(@alignCast(ctx));
-                s.tailscaleCall("server.tailscale.logout", .{});
+                s.tailscaleCall("server.tailscale.logout", null);
             }
         }.go);
     }
@@ -552,7 +552,7 @@ pub const ServerPage = struct {
 
     fn onReload(_: *gtk.Button, self: *ServerPage) callconv(.c) void {
         self.outstanding += 1;
-        self.local().call("server.config_reload", .{}, self, &onReloaded);
+        self.local().call("server.config_reload", null, self, &onReloaded);
     }
 
     fn onReloaded(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {

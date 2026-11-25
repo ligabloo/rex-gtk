@@ -194,7 +194,73 @@ pub const defaults = [_]Binding{
     .{ .keys = &.{"ctrl+0"}, .action = "client.font.reset" },
     .{ .keys = &.{"f11"}, .action = "client.window.fullscreen.toggle" },
     .{ .keys = &.{"ctrl+,"}, .action = "client.preferences" },
+    .{ .keys = &.{"ctrl+shift+p"}, .action = "client.palette.toggle" },
+    .{ .keys = &.{"ctrl+?"}, .action = "client.shortcuts" },
+    .{ .keys = &.{"shift+f10"}, .action = "pane.menu" },
 };
+
+/// A key spec as a GTK accelerator, such as `<Control><Shift>c`, for
+/// showing it in menus. Null for keys GTK can't name.
+pub fn gtkAccel(buf: []u8, spec: []const u8) ?[]const u8 {
+    const key = Key.parse(spec) orelse return null;
+    var w: std.Io.Writer = .fixed(buf);
+    if (key.mods.ctrl) w.writeAll("<Control>") catch return null;
+    if (key.mods.shift) w.writeAll("<Shift>") catch return null;
+    if (key.mods.alt) w.writeAll("<Alt>") catch return null;
+    if (key.mods.super) w.writeAll("<Super>") catch return null;
+    switch (key.key) {
+        .char => |c| {
+            const names = .{
+                .{ ',', "comma" },        .{ '.', "period" },      .{ '=', "equal" },
+                .{ '+', "plus" },         .{ '-', "minus" },       .{ '[', "bracketleft" },
+                .{ ']', "bracketright" }, .{ '/', "slash" },       .{ '\\', "backslash" },
+                .{ ';', "semicolon" },    .{ '\'', "apostrophe" }, .{ '`', "grave" },
+                .{ '?', "question" },     .{ ' ', "space" },
+            };
+            inline for (names) |n| if (c == n[0]) {
+                w.writeAll(n[1]) catch return null;
+                return w.buffered();
+            };
+            if (c >= 128) return null;
+            w.writeByte(@intCast(c)) catch return null;
+        },
+        .physical => |name| {
+            const table = .{
+                .{ "arrow_left", "Left" },  .{ "arrow_right", "Right" }, .{ "arrow_up", "Up" },
+                .{ "arrow_down", "Down" },  .{ "page_up", "Page_Up" },   .{ "page_down", "Page_Down" },
+                .{ "enter", "Return" },     .{ "escape", "Escape" },     .{ "tab", "Tab" },
+                .{ "delete", "Delete" },    .{ "backspace", "BackSpace" }, .{ "home", "Home" },
+                .{ "end", "End" },          .{ "insert", "Insert" },     .{ "space", "space" },
+            };
+            inline for (table) |e| if (std.mem.eql(u8, name, e[0])) {
+                w.writeAll(e[1]) catch return null;
+                return w.buffered();
+            };
+            // F1 to F24.
+            if (name.len >= 2 and name.len <= 3 and (name[0] == 'f' or name[0] == 'F')) {
+                _ = std.fmt.parseInt(u8, name[1..], 10) catch return null;
+                w.print("F{s}", .{name[1..]}) catch return null;
+                return w.buffered();
+            }
+            return null;
+        },
+    }
+    return w.buffered();
+}
+
+test "gtk accelerators" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("<Control><Shift>c", gtkAccel(&buf, "ctrl+shift+c").?);
+    try t.expectEqualStrings("<Control>comma", gtkAccel(&buf, "ctrl+,").?);
+    try t.expectEqualStrings("<Control>plus", gtkAccel(&buf, "ctrl++").?);
+    try t.expectEqualStrings("<Control><Alt>Left", gtkAccel(&buf, "ctrl+alt+left").?);
+    try t.expectEqualStrings("<Control><Shift>Return", gtkAccel(&buf, "ctrl+shift+enter").?);
+    try t.expectEqualStrings("<Control>Page_Down", gtkAccel(&buf, "ctrl+pagedown").?);
+    try t.expectEqualStrings("F11", gtkAccel(&buf, "f11").?);
+    try t.expectEqualStrings("<Alt>1", gtkAccel(&buf, "alt+1").?);
+    try t.expect(gtkAccel(&buf, "ctrl+[KeyK]") == null);
+}
 
 test "parse and match" {
     const t = std.testing;

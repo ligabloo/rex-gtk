@@ -13,6 +13,7 @@ const tv = @import("terminal_view.zig");
 const mouse = @import("mouse.zig");
 const Incoming = @import("client.zig").Incoming;
 const api = @import("api.zig");
+const Machine = @import("machine.zig").Machine;
 
 const log = std.log.scoped(.actions);
 
@@ -84,8 +85,14 @@ pub const all = [_]Action{
     .{ .name = "client.font.reset", .title = "Reset Font Size", .category = "View" },
     .{ .name = "client.window.fullscreen.toggle", .title = "Toggle Full Screen", .category = "Window" },
     .{ .name = "client.close", .title = "Close", .category = "Window" },
+    .{ .name = "client.palette.toggle", .title = "Command Palette", .category = "Window" },
+    .{ .name = "client.shortcuts", .title = "Keyboard Shortcuts", .category = "Window" },
+    .{ .name = "client.about", .title = "About rex-gtk", .category = "Window" },
+    .{ .name = "client.sidebar.filter", .title = "Filter Tabs", .category = "View" },
+    .{ .name = "pane.reset", .title = "Reset Terminal", .category = "Panes" },
+    .{ .name = "pane.menu", .title = "Show Pane Menu", .category = "Panes" },
     .{ .name = "client.preferences", .title = "Preferences", .category = "Window", .args =
-    \\{"type":"object","properties":{"page":{"enum":["server","general","machines"],"type":"string","description":"The page to show."},"machine":{"type":"string","description":"On the Machines page, the machine whose details to show, by name."}}}
+    \\{"type":"object","properties":{"page":{"enum":["server","general","machines","appearance"],"type":"string","description":"The page to show."},"machine":{"type":"string","description":"On the Machines page, the machine whose details to show, by name."}}}
     },
 };
 
@@ -119,6 +126,10 @@ pub fn perform(app: *App, name: []const u8, args: std.json.Value) Error!void {
         (app.window orelse return error.NoTarget).as(gtk.Window).close();
         return;
     }
+    if (eq(u8, name, "client.palette.toggle")) return @import("palette.zig").toggle(app);
+    if (eq(u8, name, "client.shortcuts")) return app.showShortcuts();
+    if (eq(u8, name, "client.about")) return app.showAbout();
+    if (eq(u8, name, "client.sidebar.filter")) return app.startFilter();
     if (eq(u8, name, "client.preferences")) {
         app.showPreferences();
         const prefs = app.prefs orelse return;
@@ -209,6 +220,18 @@ pub fn perform(app: *App, name: []const u8, args: std.json.Value) Error!void {
 
     const pane = view.focusedPane(tab) orelse return error.NoTarget;
     const widget = pane.widgetPtr();
+    if (eq(u8, name, "pane.menu")) {
+        const w = pane.widgetPtr();
+        const cm = pane.services.context_menu orelse return error.NotSupported;
+        return cm.func(cm.ctx, pane, @as(f64, @floatFromInt(w.getWidth())) / 2, @as(f64, @floatFromInt(w.getHeight())) / 3);
+    }
+    if (eq(u8, name, "pane.reset")) {
+        return pane.machine.send("com.superlogical.terminal.reset", .{
+            .session_id = pane.session_id,
+            .block_id = pane.block_id,
+            .args = struct {}{},
+        });
+    }
     if (eq(u8, name, "pane.copy")) return mouse.copyTo(pane, widget.getClipboard());
     if (eq(u8, name, "pane.paste")) return mouse.pasteFrom(pane, widget.getClipboard());
     if (eq(u8, name, "pane.select_all")) {
@@ -302,15 +325,21 @@ fn stepSession(app: *App, step: i64) Error!void {
 }
 
 fn newSession(app: *App) void {
-    app.rex().call("session.create", .{ .initial_windows = &[_]struct { layout: ShellLayout }{.{ .layout = shellLayout(app) }} }, app, &onSessionCreated);
+    newSessionOn(app, app.rex());
+}
+
+/// Start a session with one shell on `m`, and show it.
+pub fn newSessionOn(app: *App, m: *Machine) void {
+    m.call("session.create", .{ .initial_windows = &[_]struct { layout: ShellLayout }{.{ .layout = shellLayout(app) }} }, m, &onSessionCreated);
 }
 
 fn onSessionCreated(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const m: *Machine = @ptrCast(@alignCast(ctx.?));
+    const app: *App = @ptrCast(@alignCast(m.listener.ctx));
     const msg = maybe_msg orelse return;
     defer msg.deinit();
     const res = api.parse(struct { session: struct { session_id: []const u8 } }, msg) orelse return;
-    app.switchSessionById(res.session.session_id);
+    app.switchSession(m, res.session.session_id);
 }
 
 // ----------------------------------------------------------------------

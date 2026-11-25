@@ -17,12 +17,16 @@ const machine_mod = @import("machine.zig");
 const Machine = machine_mod.Machine;
 const Settings = @import("settings.zig").Settings;
 const Prefs = @import("prefs/window.zig").Prefs;
+const Sidebar = @import("sidebar.zig").Sidebar;
+const Header = @import("header.zig").Header;
+const overview = @import("overview.zig");
 const tv = @import("terminal_view.zig");
 const api = @import("api.zig");
 const SessionView = @import("session_view.zig").SessionView;
 const actions = @import("actions.zig");
 const Keys = @import("keys.zig").Keys;
 const prompts = @import("prompts.zig");
+const keymap = @import("keymap.zig");
 
 const log = std.log.scoped(.app);
 
@@ -51,12 +55,6 @@ pub const Startup = struct {
     ssh_env: core.ssh.Env = .{ .ssh_auth_sock = null, .xdg_runtime_dir = null, .home = null },
 };
 
-/// A row of the sidebar: a machine's heading, or one of its sessions.
-const Row = struct {
-    machine: *Machine,
-    session: ?usize = null,
-};
-
 /// The session to show once its machine connects.
 const Want = struct {
     machine_id: []u8,
@@ -75,7 +73,10 @@ pub const App = struct {
     window_title: ?*adw.WindowTitle = null,
     content: ?*adw.ToolbarView = null,
     tab_bar: ?*adw.TabBar = null,
-    session_list: ?*gtk.ListBox = null,
+    sidebar: Sidebar = undefined,
+    sidebar_ready: bool = false,
+    header: Header = undefined,
+    header_ready: bool = false,
     split_view: ?*adw.OverlaySplitView = null,
 
     /// The terminal font size in points; starts at `options.font_size`.
@@ -89,9 +90,6 @@ pub const App = struct {
     /// This computer's server first, then the user's hosts.
     machines: std.ArrayList(*Machine) = .empty,
     hosts_pending: bool = false,
-    /// The sidebar's rows, in order.
-    rows: std.ArrayList(Row) = .empty,
-    list_syncing: bool = false,
     /// The session we show.
     view: ?*SessionView = null,
     /// The session to show again after a reconnect, or the one
@@ -179,54 +177,20 @@ pub const App = struct {
         self.window = window;
         _ = gobject.Object.signals.notify.connect(window, *App, &onActiveChanged, self, .{ .detail = "is-active" });
 
-        // Sidebar: the sessions.
-        const list = gtk.ListBox.new();
-        list.as(gtk.Widget).addCssClass("navigation-sidebar");
-        _ = gtk.ListBox.signals.row_selected.connect(list, *App, &onRowSelected, self, .{});
-        self.session_list = list;
-        const scroller = gtk.ScrolledWindow.new();
-        scroller.setChild(list.as(gtk.Widget));
-        scroller.setPolicy(.never, .automatic);
-        const side_header = adw.HeaderBar.new();
-        side_header.setTitleWidget(adw.WindowTitle.new("Sessions", "").as(gtk.Widget));
-        const sidebar = adw.ToolbarView.new();
-        sidebar.addTopBar(side_header.as(gtk.Widget));
-        sidebar.setContent(scroller.as(gtk.Widget));
+        // Sidebar: every machine's sessions and their tabs.
+        self.sidebar.init(self);
+        self.sidebar_ready = true;
+        self.loadCss();
 
-        // Content: the session's windows as tabs.
-        const title = adw.WindowTitle.new("Rex", "");
-        self.window_title = title;
-        const header = adw.HeaderBar.new();
-        header.setTitleWidget(title.as(gtk.Widget));
-        const toggle = gtk.ToggleButton.new();
-        toggle.as(gtk.Button).setIconName("sidebar-show-symbolic");
-        toggle.as(gtk.Widget).setTooltipText("Sessions");
-        header.packStart(toggle.as(gtk.Widget));
-        header.packEnd(self.primaryMenu().as(gtk.Widget));
-        const new_tab = gtk.Button.newFromIconName("tab-new-symbolic");
-        new_tab.as(gtk.Widget).setTooltipText("New Tab");
-        new_tab.as(gtk.Actionable).setActionName("app.rex");
-        new_tab.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.tab.new"));
-        header.packEnd(new_tab.as(gtk.Widget));
-
-        const tab_bar = adw.TabBar.new();
-        tab_bar.setAutohide(1);
-        self.tab_bar = tab_bar;
-
-        const content = adw.ToolbarView.new();
-        content.addTopBar(header.as(gtk.Widget));
-        content.addTopBar(tab_bar.as(gtk.Widget));
-        self.content = content;
-
-        const split = adw.OverlaySplitView.new();
-        split.setSidebar(sidebar.as(gtk.Widget));
-        split.setContent(content.as(gtk.Widget));
-        split.setShowSidebar(0);
-        self.split_view = split;
-        _ = split.as(gobject.Object).bindProperty("show-sidebar", toggle.as(gobject.Object), "active", .{
-            .bidirectional = true,
-            .sync_create = true,
-        });
+        // Content: the session's windows, under the header bar.
+        self.registerActions();
+        self.header.init(self, self.sidebar.widget);
+        self.header_ready = true;
+        self.window_title = self.header.title;
+        self.tab_bar = self.header.tab_bar;
+        self.content = self.header.content;
+        self.split_view = self.header.split;
+        const split = self.header.split;
 
         window.setContent(split.as(gtk.Widget));
         self.showStatus("utilities-terminal-symbolic", "Connecting…", null);
@@ -239,37 +203,121 @@ pub const App = struct {
         };
     }
 
-    /// The menu behind the header bar's menu button. Each item performs a
-    /// Rex action through the "app.rex" action.
-    fn primaryMenu(self: *App) *gtk.MenuButton {
+    /// "app.rex" performs the Rex action its string names, for buttons and
+    /// menus.
+    fn registerActions(self: *App) void {
         const rex_action = gio.SimpleAction.new("rex", glib.VariantType.new("s"));
         _ = gio.SimpleAction.signals.activate.connect(rex_action, *App, &onRexAction, self, .{});
         self.adw_app.as(gio.ActionMap).addAction(rex_action.as(gio.Action));
+    }
 
+    /// The pane menu, from a right click: as in Rex.app, this is where the
+    /// main menu's items live.
+    fn onContextMenu(ctx: *anyopaque, pane: *tv.Pane, x: f64, y: f64) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
         const sections = [_][]const [2][:0]const u8{
-            &.{ .{ "New Tab", "client.tab.new" }, .{ "New Session", "session.new" } },
-            &.{ .{ "Split Right", "pane.split.right" }, .{ "Split Down", "pane.split.down" }, .{ "Zoom Pane", "pane.zoom" }, .{ "Float Pane", "pane.float" }, .{ "Close Pane", "pane.close" } },
-            &.{ .{ "Rename Tab…", "client.tab.rename" }, .{ "Rename Pane…", "pane.rename" }, .{ "Rename Session…", "session.rename" }, .{ "Close Session…", "session.close" } },
-            &.{ .{ "Toggle Sidebar", "client.sidebar.toggle" }, .{ "Full Screen", "client.window.fullscreen.toggle" }, .{ "Preferences", "client.preferences" } },
+            &.{ .{ "Copy", "pane.copy" }, .{ "Paste", "pane.paste" } },
+            &.{ .{ "Split Right", "pane.split.right" }, .{ "Split Left", "pane.split.left" }, .{ "Split Down", "pane.split.down" }, .{ "Split Up", "pane.split.up" }, .{ "Float Pane", "pane.float" }, .{ "Zoom Pane", "pane.zoom" } },
+            &.{ .{ "Close Pane", "pane.close" }, .{ "Reset Terminal", "pane.reset" } },
+            &.{ .{ "Full Screen", "client.window.fullscreen.toggle" }, .{ "Preferences", "client.preferences" }, .{ "Keyboard Shortcuts", "client.shortcuts" }, .{ "About rex-gtk", "client.about" } },
         };
         const menu = gio.Menu.new();
+        defer menu.as(gobject.Object).unref();
         inline for (sections) |items| {
             const section = gio.Menu.new();
             for (items) |item| {
                 const mi = gio.MenuItem.new(item[0], null);
                 mi.setActionAndTargetValue("app.rex", glib.Variant.newString(item[1]));
+                var buf: [64]u8 = undefined;
+                var zbuf: [64]u8 = undefined;
+                if (self.keys.keyFor(item[1])) |spec| if (keymap.gtkAccel(&buf, spec)) |accel| {
+                    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{accel}, 0) catch "";
+                    mi.setAttributeValue("accel", glib.Variant.newString(z));
+                };
                 section.appendItem(mi);
                 mi.as(gobject.Object).unref();
             }
             menu.appendSection(null, section.as(gio.MenuModel));
             section.as(gobject.Object).unref();
         }
-        const button = gtk.MenuButton.new();
-        button.setIconName("open-menu-symbolic");
-        button.setMenuModel(menu.as(gio.MenuModel));
-        button.as(gtk.Widget).setTooltipText("Main Menu");
-        menu.as(gobject.Object).unref();
-        return button;
+        const popover = gtk.PopoverMenu.newFromModel(menu.as(gio.MenuModel));
+        const p = popover.as(gtk.Popover);
+        popover.as(gtk.Widget).setParent(pane.widgetPtr());
+        p.setHasArrow(0);
+        p.setPosition(.bottom);
+        popover.as(gtk.Widget).setHalign(.start);
+        const rect: gdk.Rectangle = .{ .f_x = @intFromFloat(x), .f_y = @intFromFloat(y), .f_width = 1, .f_height = 1 };
+        p.setPointingTo(&rect);
+        _ = gtk.Popover.signals.closed.connect(p, ?*anyopaque, &onMenuClosed, null, .{});
+        p.popup();
+    }
+
+    fn onMenuClosed(p: *gtk.Popover, _: ?*anyopaque) callconv(.c) void {
+        // After the menu runs its item's action.
+        _ = glib.idleAdd(&struct {
+            fn f(data: ?*anyopaque) callconv(.c) c_int {
+                const w: *gtk.Widget = @ptrCast(@alignCast(data.?));
+                w.unparent();
+                return 0;
+            }
+        }.f, p);
+    }
+
+    pub fn showAbout(self: *App) void {
+        const about = adw.AboutDialog.new();
+        about.setApplicationName("rex-gtk");
+        about.setApplicationIcon(app_id);
+        about.setVersion("0.1.0");
+        about.setDeveloperName("ligabloo");
+        about.setComments("A GNOME client for Rex, the multiplexer for all work.");
+        about.setWebsite("https://github.com/ligabloo/rex-gtk");
+        about.setIssueUrl("https://github.com/ligabloo/rex-gtk/issues");
+        about.setLicenseType(.mit_x11);
+        about.as(adw.Dialog).present(if (self.window) |w| w.as(gtk.Widget) else null);
+    }
+
+    /// Every single-key binding, grouped as the action list groups them.
+    pub fn showShortcuts(self: *App) void {
+        const dialog = adw.ShortcutsDialog.new();
+        const categories = [_][:0]const u8{ "Tabs", "Panes", "Sessions", "Edit", "View", "Window" };
+        for (categories) |cat| {
+            const section = adw.ShortcutsSection.new(cat);
+            var any = false;
+            for (actions.all) |act| {
+                if (!std.mem.eql(u8, act.category, cat)) continue;
+                for (self.keys.allBindings()) |b| {
+                    if (b.mode != null or b.keys.len != 1 or !std.mem.eql(u8, b.action, act.name)) continue;
+                    var buf: [64]u8 = undefined;
+                    const accel = keymap.gtkAccel(&buf, b.keys[0]) orelse continue;
+                    var tbuf: [128]u8 = undefined;
+                    var abuf: [64]u8 = undefined;
+                    // Bindings with arguments, such as alt+1 for the first tab.
+                    const title = if (b.args) |a|
+                        std.fmt.bufPrintSentinel(&tbuf, "{s} {s}", .{ act.title, argSuffix(a) }, 0) catch continue
+                    else
+                        std.fmt.bufPrintSentinel(&tbuf, "{s}", .{act.title}, 0) catch continue;
+                    section.add(adw.ShortcutsItem.new(title, std.fmt.bufPrintSentinel(&abuf, "{s}", .{accel}, 0) catch continue));
+                    any = true;
+                }
+            }
+            if (any) dialog.add(section) else section.as(gobject.Object).refSink().as(gobject.Object).unref();
+        }
+        dialog.as(adw.Dialog).present(if (self.window) |w| w.as(gtk.Widget) else null);
+    }
+
+    /// A short note for a binding's arguments, such as "1" for {"index":1}.
+    fn argSuffix(args: []const u8) []const u8 {
+        // Show the first value: an index or a direction.
+        const colon = std.mem.indexOfScalar(u8, args, ':') orelse return "";
+        const rest = std.mem.trim(u8, args[colon + 1 ..], " }\"");
+        if (std.mem.eql(u8, rest, "-1")) return "(last)";
+        return rest;
+    }
+
+    pub fn startFilter(self: *App) void {
+        if (self.header_ready and self.header.layout == .header) return;
+        if (self.split_view) |s| s.setShowSidebar(1);
+        if (self.sidebar_ready) self.sidebar.startFilter();
     }
 
     fn onRexAction(_: *gio.SimpleAction, param: ?*glib.Variant, self: *App) callconv(.c) void {
@@ -278,6 +326,7 @@ pub const App = struct {
     }
 
     pub fn toggleSidebar(self: *App) void {
+        if (self.header_ready and self.header.layout == .header) return;
         const split = self.split_view orelse return;
         split.setShowSidebar(@intFromBool(split.getShowSidebar() == 0));
     }
@@ -339,7 +388,8 @@ pub const App = struct {
         self.view = null;
         for (self.machines.items) |m| m.destroy();
         self.machines.deinit(self.gpa);
-        self.rows.deinit(self.gpa);
+        if (self.sidebar_ready) self.sidebar.deinit();
+        if (self.header_ready) self.header.deinit();
         self.clearWant();
         if (self.services) |*s| {
             s.fonts.destroy();
@@ -363,7 +413,10 @@ pub const App = struct {
     fn updateTitle(self: *App) void {
         if (self.window_title == null) return;
         const view = self.view orelse return self.setTitle("Rex", "");
+        // The tab's name over "session · machine", unless a key sequence or
+        // mode is under way.
         var buf: [256]u8 = undefined;
+        const session_name = if (view.label.len > 0) view.label else "Session";
         const subtitle: []const u8 = if (self.keys.pendingPrefix().len > 0) sub: {
             var w: std.Io.Writer = .fixed(&buf);
             for (self.keys.pendingPrefix()) |k| w.print("{s} ", .{k}) catch {};
@@ -372,8 +425,16 @@ pub const App = struct {
         } else if (self.keys.modeName()) |m|
             std.fmt.bufPrint(&buf, "{s} mode", .{m}) catch m
         else
-            view.activeTitle() orelse "";
-        self.setTitle(if (view.label.len > 0) view.label else "Rex", subtitle);
+            std.fmt.bufPrint(&buf, "{s} · {s}", .{ session_name, view.machine.title() }) catch session_name;
+        self.setTitle(view.activeTabTitle() orelse session_name, subtitle);
+        if (self.header_ready) {
+            var a: [256]u8 = undefined;
+            var b: [128]u8 = undefined;
+            self.header.setSession(
+                std.fmt.bufPrintSentinel(&a, "{s}", .{session_name}, 0) catch "Session",
+                std.fmt.bufPrintSentinel(&b, "{s}", .{view.machine.title()}, 0) catch "",
+            );
+        }
     }
 
     fn setTitle(self: *App, title: []const u8, subtitle: []const u8) void {
@@ -418,6 +479,7 @@ pub const App = struct {
             .dark = self.adw_app.getStyleManager().getDark() != 0,
             .app = self.adw_app.as(gio.Application),
             .shortcut = .{ .ctx = self, .func = onShortcut },
+            .context_menu = .{ .ctx = self, .func = onContextMenu },
         };
         _ = gobject.Object.signals.notify.connect(
             self.adw_app.getStyleManager(),
@@ -453,9 +515,24 @@ pub const App = struct {
             .client_label = self.clientLabel(),
         });
         errdefer local.destroy();
+        self.watch(local);
         local.autostart = self.settings.getBool("startup.start_server", true);
         try self.machines.append(self.gpa, local);
         local.connect(false);
+    }
+
+    /// Hear about a machine's tabs as well as its connection.
+    fn watch(self: *App, m: *Machine) void {
+        m.overview.changed = .{ .ctx = self, .func = onOverviewChanged };
+    }
+
+    fn onOverviewChanged(ctx: *anyopaque, m: *Machine) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.rebuildSidebar();
+        if (self.view) |v| if (v.machine == m) {
+            v.titlesChanged();
+            self.updateTitle();
+        };
     }
 
     fn machineListener(self: *App) machine_mod.Listener {
@@ -721,6 +798,8 @@ pub const App = struct {
             for (self.machines.items) |m| m.setClientLabel(label);
         } else if (eq(u8, key, "startup.start_server")) {
             self.localMachine().autostart = self.settings.getBool(key, true);
+        } else if (eq(u8, key, "tabs.layout") or eq(u8, key, "header.behavior")) {
+            if (self.header_ready) self.header.applySettings();
         } else if (eq(u8, key, "ssh.agent") or eq(u8, key, "ssh.agent_path")) {
             self.retrySsh();
         }
@@ -797,6 +876,7 @@ pub const App = struct {
                 .client_label = self.clientLabel(),
             }) catch continue;
             if (json_text) |t| m.setHostJson(t, from_config);
+            self.watch(m);
             self.machines.append(self.gpa, m) catch {
                 m.destroy();
                 continue;
@@ -908,6 +988,7 @@ pub const App = struct {
             self.tab_bar.?.setView(view.tab_view);
         }
         self.updateTitle();
+        self.selectCurrentRow();
     }
 
     fn emptySession() *adw.StatusPage {
@@ -951,96 +1032,29 @@ pub const App = struct {
     // Sidebar
 
     fn rebuildSidebar(self: *App) void {
-        const box = self.session_list orelse return;
-        self.list_syncing = true;
-        defer self.list_syncing = false;
-        box.removeAll();
-        self.rows.clearRetainingCapacity();
-        for (self.machines.items) |m| {
-            self.rows.append(self.gpa, .{ .machine = m }) catch return;
-            box.append(self.machineRow(m).as(gtk.Widget));
-            if (m.state != .connected) continue;
-            for (m.sessions.items, 0..) |s, i| {
-                self.rows.append(self.gpa, .{ .machine = m, .session = i }) catch return;
-                var buf: [256]u8 = undefined;
-                const text = std.fmt.bufPrintSentinel(&buf, "{s}", .{if (s.label.len > 0) s.label else s.session_id}, 0) catch "session";
-                const label = gtk.Label.new(text);
-                label.setXalign(0);
-                label.setEllipsize(.end);
-                label.as(gtk.Widget).setMarginStart(12);
-                box.append(label.as(gtk.Widget));
-            }
-        }
-        self.selectCurrentRow();
-    }
-
-    /// A machine's heading: its name, and a warning to try again when it
-    /// can't be reached.
-    fn machineRow(self: *App, m: *Machine) *gtk.ListBoxRow {
-        const row = gtk.ListBoxRow.new();
-        row.setActivatable(0);
-        row.setSelectable(0);
-        const hbox = gtk.Box.new(.horizontal, 6);
-        const icon = gtk.Image.newFromIconName(if (m.is_local) "computer-symbolic" else "network-server-symbolic");
-        hbox.append(icon.as(gtk.Widget));
-        var buf: [128]u8 = undefined;
-        const name = std.fmt.bufPrintSentinel(&buf, "{s}", .{m.title()}, 0) catch "Machine";
-        const label = gtk.Label.new(name);
-        label.setXalign(0);
-        label.setEllipsize(.end);
-        label.as(gtk.Widget).setHexpand(1);
-        label.as(gtk.Widget).addCssClass("heading");
-        hbox.append(label.as(gtk.Widget));
-        switch (m.state) {
-            .connecting => {
-                const spinner = adw.Spinner.new();
-                hbox.append(spinner.as(gtk.Widget));
-            },
-            .offline => {
-                const button = gtk.Button.newFromIconName("dialog-warning-symbolic");
-                button.as(gtk.Widget).addCssClass("flat");
-                var tip: [512]u8 = undefined;
-                const text = std.fmt.bufPrintSentinel(&tip, "Can't reach {s}. {s} Click to try again.", .{ m.title(), m.detail orelse "" }, 0) catch "Click to try again.";
-                button.as(gtk.Widget).setTooltipText(text);
-                _ = gtk.Button.signals.clicked.connect(button, *Machine, &onRetryClicked, m, .{});
-                hbox.append(button.as(gtk.Widget));
-            },
-            .idle, .connected => {},
-        }
-        row.setChild(hbox.as(gtk.Widget));
-        _ = self;
-        return row;
-    }
-
-    fn onRetryClicked(_: *gtk.Button, m: *Machine) callconv(.c) void {
-        m.connect(true);
+        if (self.sidebar_ready) self.sidebar.scheduleRebuild();
     }
 
     fn selectCurrentRow(self: *App) void {
-        const box = self.session_list orelse return;
-        self.list_syncing = true;
-        defer self.list_syncing = false;
-        const view = self.view orelse return box.selectRow(null);
-        for (self.rows.items, 0..) |r, i| {
-            const si = r.session orelse continue;
-            if (r.machine != view.machine) continue;
-            if (std.mem.eql(u8, r.machine.sessions.items[si].session_id, view.session_id)) {
-                box.selectRow(box.getRowAtIndex(@intCast(i)));
-                return;
-            }
-        }
-        box.selectRow(null);
+        if (self.sidebar_ready) self.sidebar.selectCurrent();
     }
 
-    fn onRowSelected(_: *gtk.ListBox, row: ?*gtk.ListBoxRow, self: *App) callconv(.c) void {
-        if (self.list_syncing) return;
-        const r = row orelse return;
-        const i: usize = @intCast(r.getIndex());
-        if (i >= self.rows.items.len) return;
-        const entry = self.rows.items[i];
-        const si = entry.session orelse return;
-        if (si >= entry.machine.sessions.items.len) return;
-        self.switchSession(entry.machine, entry.machine.sessions.items[si].session_id);
+    /// Show one of a session's tabs, switching sessions if needed.
+    pub fn showTab(self: *App, m: *Machine, session_id: []const u8, window_id: []const u8) void {
+        if (self.view) |v| if (v.machine == m and std.mem.eql(u8, v.session_id, session_id)) {
+            v.selectWindow(window_id);
+            return;
+        };
+        // Focus it first, so the view we attach to shows it.
+        m.send("session.focus_window", .{ .session_id = session_id, .window_id = window_id });
+        self.switchSession(m, session_id);
+    }
+
+    fn loadCss(_: *App) void {
+        const provider = gtk.CssProvider.new();
+        provider.loadFromString(@embedFile("style.css"));
+        const display = gdk.Display.getDefault() orelse return;
+        gtk.StyleContext.addProviderForDisplay(display, provider.as(gtk.StyleProvider), gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 
     /// The shown session is gone: show another, or say there are none.
@@ -1115,6 +1129,7 @@ pub const App = struct {
             self.sessionGone(m, p.session_id);
         } else if (eq(u8, ev.name, "session_event")) {
             const se = api.parseValue(api.SessionEvent, msg, ev.payload) orelse return;
+            m.overview.sessionEvent(msg, se.session_id, se.event.type, se.event.payload);
             if (eq(u8, se.event.type, "session_label_changed")) m.refreshSessions();
             const view = self.view orelse return;
             if (view.machine != m or !eq(u8, se.session_id, view.session_id)) return;

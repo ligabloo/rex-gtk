@@ -23,6 +23,7 @@ const Client = @import("client.zig").Client;
 const Incoming = @import("client.zig").Incoming;
 const ResponseFn = @import("client.zig").ResponseFn;
 const mainloop = @import("mainloop.zig");
+const Overview = @import("overview.zig").Overview;
 
 const log = std.log.scoped(.machine);
 
@@ -96,6 +97,8 @@ pub const Machine = struct {
 
     /// The sessions on the server, in its order.
     sessions: std.ArrayList(SessionItem) = .empty,
+    /// Each session's tabs, for the sidebar.
+    overview: Overview = undefined,
     list_pending: bool = false,
 
     /// Counts connection attempts, so a late result of an abandoned one is
@@ -127,6 +130,7 @@ pub const Machine = struct {
             .is_local = options.is_local,
             .client_label = if (options.client_label) |l| try gpa.dupe(u8, l) else null,
         };
+        self.overview = .init(gpa, self);
         return self;
     }
 
@@ -134,6 +138,8 @@ pub const Machine = struct {
         self.stop();
         if (self.client) |c| c.destroy();
         if (self.dead_client) |c| c.destroy();
+        // After the clients: closing them answers its requests.
+        self.overview.deinit();
         const gpa = self.gpa;
         gpa.free(self.id);
         gpa.free(self.label);
@@ -257,6 +263,10 @@ pub const Machine = struct {
                 self.gpa.free(label);
             };
         }
+        var ids: std.ArrayList([]const u8) = .empty;
+        defer ids.deinit(self.gpa);
+        for (self.sessions.items) |s| ids.append(self.gpa, s.session_id) catch {};
+        self.overview.sync(ids.items);
         self.listener.changed(self.listener.ctx, self);
     }
 
@@ -304,6 +314,7 @@ pub const Machine = struct {
         if (self.client) |c| {
             self.client = null;
             c.destroy();
+            self.overview.clear();
             self.listener.disconnected(self.listener.ctx, self);
         }
         freeOpt(self.gpa, &self.endpoint_text);
@@ -499,6 +510,7 @@ pub const Machine = struct {
         if (self.dead_client) |old| old.destroy();
         self.dead_client = client;
         freeOpt(self.gpa, &self.endpoint_text);
+        self.overview.clear();
         self.listener.disconnected(self.listener.ctx, self);
         self.stop();
         self.failures = 0;

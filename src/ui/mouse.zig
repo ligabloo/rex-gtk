@@ -193,6 +193,7 @@ fn onPressed(click: *gtk.GestureClick, _: c_int, x: f64, y: f64, pane: *Pane) ca
             pane.selectionChanged();
         },
         2 => pasteFrom(pane, widget.getPrimaryClipboard()),
+        3 => if (pane.services.context_menu) |cm| cm.func(cm.ctx, pane, x, y),
         else => {},
     }
 }

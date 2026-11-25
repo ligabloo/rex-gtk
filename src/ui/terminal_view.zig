@@ -42,6 +42,11 @@ pub const Services = struct {
     dark: bool = true,
     /// For desktop notifications.
     app: ?*@import("gio").Application = null,
+    /// Asked to show the pane menu at a point in the pane.
+    context_menu: ?struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, pane: *Pane, x: f64, y: f64) void,
+    } = null,
     /// Gets every key press first; returns true if it was a shortcut.
     shortcut: ?struct {
         ctx: *anyopaque,
@@ -799,6 +804,14 @@ pub const TerminalWidget = extern struct {
 
     fn sizeAllocate(self: *TerminalWidget, width: c_int, height: c_int, baseline: c_int) callconv(.c) void {
         gtk.Widget.virtual_methods.size_allocate.call(Class.parent, self.as(gtk.Widget), width, height, baseline);
+        // The pane menu is our child: popovers are placed by their parent.
+        var child = self.as(gtk.Widget).getFirstChild();
+        while (child) |c| : (child = c.getNextSibling()) {
+            if (gobject.typeCheckInstanceIsA(@ptrCast(c), gtk.Popover.getGObjectType()) != 0) {
+                const popover: *gtk.Popover = @ptrCast(c);
+                popover.present();
+            }
+        }
         const pane = self.pane orelse return;
         const s = self.scale();
         pane.onResize(
@@ -882,6 +895,7 @@ pub const TerminalWidget = extern struct {
 
     fn dispose(self: *TerminalWidget) callconv(.c) void {
         self.setTexture(null);
+        while (self.as(gtk.Widget).getFirstChild()) |c| c.unparent();
         gobject.Object.virtual_methods.dispose.call(Class.parent, self.as(Parent));
     }
 

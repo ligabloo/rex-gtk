@@ -1,0 +1,90 @@
+//! Preferences › Appearance: where the tabs go, and how the header bar
+//! behaves while the sidebar is collapsed.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const adw = @import("adw");
+const gio = @import("gio");
+const gobject = @import("gobject");
+const gtk = @import("gtk");
+const win = @import("window.zig");
+const Prefs = win.Prefs;
+const Settings = @import("../settings.zig").Settings;
+
+const behaviors = [_][]const u8{ "hidden", "hover", "always" };
+
+pub const AppearancePage = struct {
+    prefs: *Prefs,
+    gpa: Allocator,
+    page: *adw.NavigationPage,
+    behavior: *adw.ComboRow,
+
+    pub fn create(prefs: *Prefs) !*AppearancePage {
+        const self = try prefs.gpa.create(AppearancePage);
+        const s = &prefs.app.settings;
+        const body = adw.PreferencesPage.new();
+
+        const tabs = win.group("Tabs", null);
+        const layout_row = win.actionRow("Tab layout", null);
+        const layout = adw.ToggleGroup.new();
+        layout.as(gtk.Widget).setValign(.center);
+        for ([_][3][:0]const u8{
+            .{ "sidebar", "Sidebar", "sidebar-show-symbolic" },
+            .{ "header", "Header Bar", "tab-new-symbolic" },
+        }) |t| {
+            const toggle = adw.Toggle.new();
+            toggle.setName(t[0]);
+            toggle.setLabel(t[1]);
+            toggle.setIconName(t[2]);
+            layout.add(toggle);
+        }
+        const current = s.getString("tabs.layout", "sidebar");
+        var buf: [32]u8 = undefined;
+        layout.setActiveName(win.z(&buf, "{s}", .{if (std.mem.eql(u8, current, "header")) "header" else "sidebar"}));
+        layout_row.addSuffix(layout.as(gtk.Widget));
+        tabs.add(layout_row.as(gtk.Widget));
+
+        const behavior = adw.ComboRow.new();
+        behavior.as(adw.PreferencesRow).setTitle("Header bar");
+        behavior.as(adw.ActionRow).setSubtitle("While the sidebar is hidden. Show on hover slides it in when the pointer reaches the top edge.");
+        const labels = [_:null]?[*:0]const u8{ "Hidden", "Show on hover", "Always show", null };
+        const model = gtk.StringList.new(@ptrCast(&labels));
+        behavior.setModel(model.as(gio.ListModel));
+        model.as(gobject.Object).unref();
+        const b = s.getString("header.behavior", "hover");
+        for (behaviors, 0..) |name, i| if (std.mem.eql(u8, name, b)) behavior.setSelected(@intCast(i));
+        behavior.as(gtk.Widget).setSensitive(@intFromBool(!std.mem.eql(u8, current, "header")));
+        tabs.add(behavior.as(gtk.Widget));
+        body.add(tabs);
+
+        self.* = .{
+            .prefs = prefs,
+            .gpa = prefs.gpa,
+            .page = win.navPage("Appearance", body.as(gtk.Widget)),
+            .behavior = behavior,
+        };
+        _ = gobject.Object.signals.notify.connect(layout, *AppearancePage, &onLayoutChanged, self, .{ .detail = "active-name" });
+        _ = gobject.Object.signals.notify.connect(behavior, *AppearancePage, &onBehaviorChanged, self, .{ .detail = "selected" });
+        return self;
+    }
+
+    pub fn destroy(self: *AppearancePage) void {
+        self.page.as(gobject.Object).unref();
+        self.gpa.destroy(self);
+    }
+
+    fn settings(self: *AppearancePage) *Settings {
+        return &self.prefs.app.settings;
+    }
+
+    fn onLayoutChanged(group: *adw.ToggleGroup, _: *gobject.ParamSpec, self: *AppearancePage) callconv(.c) void {
+        const name = std.mem.span(group.getActiveName() orelse return);
+        self.settings().setString("tabs.layout", name);
+        self.behavior.as(gtk.Widget).setSensitive(@intFromBool(!std.mem.eql(u8, name, "header")));
+    }
+
+    fn onBehaviorChanged(row: *adw.ComboRow, _: *gobject.ParamSpec, self: *AppearancePage) callconv(.c) void {
+        const i = row.getSelected();
+        if (i < behaviors.len) self.settings().setString("header.behavior", behaviors[i]);
+    }
+};

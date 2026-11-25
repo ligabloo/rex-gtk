@@ -143,7 +143,7 @@ pub const MachinesPage = struct {
     }
 
     fn onAddClicked(_: *adw.ButtonRow, self: *MachinesPage) callconv(.c) void {
-        AddDialog.show(self);
+        AddDialog.show(self.app, self.prefs.parentWidget());
     }
 
     fn machineById(self: *MachinesPage, id: []const u8) ?*Machine {
@@ -578,8 +578,12 @@ const AgentCheck = struct {
 // ----------------------------------------------------------------------
 // Adding a machine
 
+/// Add Machine, from the sidebar or the Machines page.
+pub fn showAddMachine(app: *App, parent: *gtk.Widget) void {
+    AddDialog.show(app, parent);
+}
+
 const AddDialog = struct {
-    owner: *MachinesPage,
     app: *App,
     gpa: Allocator,
     dialog: *adw.Dialog,
@@ -595,8 +599,8 @@ const AddDialog = struct {
     adding: bool = false,
     closed: bool = false,
 
-    fn show(owner: *MachinesPage) void {
-        const gpa = owner.gpa;
+    fn show(app: *App, parent: *gtk.Widget) void {
+        const gpa = app.gpa;
         const self = gpa.create(AddDialog) catch return;
         const dialog = adw.Dialog.new();
         dialog.setTitle("Add Machine");
@@ -646,8 +650,7 @@ const AddDialog = struct {
         dialog.setChild(toolbar.as(gtk.Widget));
 
         self.* = .{
-            .owner = owner,
-            .app = owner.app,
+            .app = app,
             .gpa = gpa,
             .dialog = dialog,
             .name = name,
@@ -663,7 +666,7 @@ const AddDialog = struct {
         _ = gtk.Button.signals.clicked.connect(add, *AddDialog, &onAdd, self, .{});
         _ = gtk.Button.signals.clicked.connect(test_button, *AddDialog, &onTest, self, .{});
         _ = adw.Dialog.signals.closed.connect(dialog, *AddDialog, &onClosed, self, .{});
-        dialog.present(owner.prefs.parentWidget());
+        dialog.present(parent);
         _ = name.as(gtk.Widget).grabFocus();
     }
 

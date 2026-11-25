@@ -17,10 +17,11 @@ const App = @import("../app.zig").App;
 const ServerPage = @import("server.zig").ServerPage;
 const GeneralPage = @import("general.zig").GeneralPage;
 const MachinesPage = @import("machines.zig").MachinesPage;
+const AppearancePage = @import("appearance.zig").AppearancePage;
 
 const log = std.log.scoped(.prefs);
 
-pub const PageId = enum { server, general, machines };
+pub const PageId = enum { server, general, machines, appearance };
 
 const PageInfo = struct {
     id: PageId,
@@ -34,6 +35,7 @@ const pages = [_]PageInfo{
     .{ .id = .server, .title = "Server", .icon = "network-server-symbolic", .keywords = "status stop restart connections address tailscale tailnet pair device qr sign in account control configuration init.lua reload" },
     .{ .id = .general, .title = "General", .icon = "preferences-system-symbolic", .keywords = "client name label remote control startup session open start server" },
     .{ .id = .machines, .title = "Machines", .icon = "computer-symbolic", .keywords = "hosts remote ssh agent keys add machine address check" },
+    .{ .id = .appearance, .title = "Appearance", .icon = "applications-graphics-symbolic", .keywords = "tabs layout sidebar header bar hide hover" },
 };
 
 pub const Prefs = struct {
@@ -52,6 +54,7 @@ pub const Prefs = struct {
     server: *ServerPage,
     general: *GeneralPage,
     machines: *MachinesPage,
+    appearance: *AppearancePage,
     current: PageId = .server,
     closed_handler: c_ulong = 0,
 
@@ -121,6 +124,7 @@ pub const Prefs = struct {
             .server = undefined,
             .general = undefined,
             .machines = undefined,
+            .appearance = undefined,
         };
 
         // The page list. The Server row ends with a dot for its state.
@@ -151,6 +155,8 @@ pub const Prefs = struct {
         self.general = try GeneralPage.create(self);
         errdefer self.general.destroy();
         self.machines = try MachinesPage.create(self);
+        errdefer self.machines.destroy();
+        self.appearance = try AppearancePage.create(self);
 
         self.closed_handler = adw.Dialog.signals.closed.connect(dialog, *Prefs, &onClosed, self, .{});
         list.selectRow(list.getRowAtIndex(0));
@@ -174,6 +180,7 @@ pub const Prefs = struct {
         self.server.destroy();
         self.general.destroy();
         self.machines.destroy();
+        self.appearance.destroy();
         self.gpa.destroy(self);
     }
 
@@ -191,6 +198,7 @@ pub const Prefs = struct {
             .server => self.server.page,
             .general => self.general.page,
             .machines => self.machines.page,
+            .appearance => self.appearance.page,
         };
         var list = [_]*adw.NavigationPage{page};
         self.nav.replace(&list, 1);

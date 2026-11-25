@@ -1,0 +1,37 @@
+/* rex-gtk's additions to Adwaita. */
+
+/* Sidebar: machine headings, session subheadings, tab rows. */
+.rex-sidebar row.machine-row {
+  margin-top: 6px;
+  min-height: 34px;
+}
+.rex-sidebar row.machine-row:first-child {
+  margin-top: 0;
+}
+.rex-sidebar row.session-row {
+  min-height: 22px;
+  padding-top: 4px;
+  padding-bottom: 0;
+}
+.rex-sidebar row.tab-row {
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
+/* The tile beside a tab's name. */
+.tab-tile {
+  min-width: 24px;
+  min-height: 24px;
+  border-radius: 6px;
+  background-color: #3d3846;
+  color: white;
+  -gtk-icon-size: 14px;
+}
+.tab-tile.agent {
+  background-color: #c64600;
+}
+@media (prefers-color-scheme: dark) {
+  .tab-tile {
+    background-color: #5e5c64;
+  }
+}

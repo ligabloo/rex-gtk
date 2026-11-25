@@ -65,6 +65,22 @@ pub const Keys = struct {
         self.scratch.deinit();
     }
 
+    /// The first single key bound to an action outside any mode, such as
+    /// "ctrl+shift+c", for menus to show.
+    pub fn keyFor(self: *const Keys, action: []const u8) ?[]const u8 {
+        for (self.bindings()) |b| {
+            if (b.mode != null or b.keys.len != 1) continue;
+            if (b.args != null) continue;
+            if (std.mem.eql(u8, b.action, action)) return b.keys[0];
+        }
+        return null;
+    }
+
+    /// Every binding, for the Keyboard Shortcuts dialog.
+    pub fn allBindings(self: *const Keys) []const keymap.Binding {
+        return self.bindings();
+    }
+
     fn bindings(self: *const Keys) []const keymap.Binding {
         return if (self.resolved) |r| r.bindings else &keymap.defaults;
     }

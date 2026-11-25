@@ -20,14 +20,28 @@ zig build run -- --session work --font "JetBrains Mono" --font-size 12
 zig build test                                 # unit tests (no display needed)
 ```
 
-Options: `--session ID|LABEL` picks the session to show (otherwise the server picks one),
+Options: `--session [HOST:]ID|LABEL` picks the session to show, on one of your hosts if
+`HOST:` is given (otherwise the server picks one),
 `--font`/`--font-size` set the terminal font, `--label` names this client for
-`rex -C LABEL …` (default: the machine's hostname). For debugging, `--dump-frame PATH` writes every terminal frame to a PNG and
+`rex -C LABEL …` (default: the name set in Preferences, or the machine's hostname). For debugging, `--dump-frame PATH` writes every terminal frame to a PNG and
 `--screenshot PATH` saves the whole window to a PNG every second.
 
-The window shows the server's sessions in a sidebar (toggle it with the button at the top left)
-and the selected session's windows as tabs. Splits, zoom and floating layers follow the server's
-view, so changes made with the `rex` CLI or another app show up live.
+The sidebar lists every machine you use: this computer, then your hosts from `rex hosts`,
+reached over ssh (`ssh://user@host`, through `rex __internal ssh-tunnel`), your tailnet, or a
+plain address. Under each machine are its sessions and their tabs, with each tab's program and
+working directory. A machine that can't be reached shows a warning; click it to try again. In
+Preferences › Appearance the tabs can move to the header bar instead, with a session switcher
+beside them, and the header bar can hide while the sidebar is collapsed, showing again when the
+pointer reaches the top edge. Splits, zoom and floating layers follow the server's view, so
+changes made with the `rex` CLI or another app show up live.
+
+Right-click a terminal (Shift+right-click when a program uses the mouse) for the pane menu:
+copy and paste, splits, zoom, reset, and the app's own items. Ctrl+Shift+P opens the command
+palette, which runs any action or jumps to any tab of any machine.
+
+Preferences (Ctrl+,) has the server's status, its Tailscale node and Pair Device QR code, the
+configuration file, your machines and the ssh agent to use. rex-gtk keeps its own settings in
+`~/.config/rex-gtk/settings.json`.
 
 Mouse: drag to select (double-click for a word, triple-click for a line); selecting copies to
 the primary selection, and middle-click pastes it. Ctrl+Shift+C and Ctrl+Shift+V copy and paste
@@ -65,6 +79,8 @@ functions all work. Built-in shortcuts:
 | Shift+PageUp / PageDown | Scroll |
 | Ctrl+Alt+PageDown / PageUp | Next / previous session |
 | Ctrl+Shift+S, F11 | Sidebar, full screen |
+| Ctrl+Shift+P, Ctrl+, , Ctrl+? | Command palette, Preferences, keyboard shortcuts |
+| Shift+F10 | Pane menu |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Font size |
 
 ## Install
