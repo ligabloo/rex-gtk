@@ -649,9 +649,13 @@ pub const App = struct {
         if (self.window) |w| w.as(gtk.Window).present();
     }
 
-    fn onOverviewChanged(ctx: *anyopaque, m: *Machine) void {
+    fn onOverviewChanged(ctx: *anyopaque, m: *Machine, title_block_id: ?[]const u8) void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        self.rebuildSidebar();
+        if (title_block_id) |block_id| {
+            if (self.sidebar_ready) self.sidebar.updateTitle(m, block_id);
+        } else {
+            self.rebuildSidebar();
+        }
         if (self.view) |v| if (v.machine == m) {
             v.titlesChanged();
             self.updateTitle();

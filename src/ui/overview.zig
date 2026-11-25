@@ -92,8 +92,8 @@ pub const Overview = struct {
     machine: *Machine,
     sessions: std.ArrayList(*Session) = .empty,
     blocks: std.StringHashMapUnmanaged(BlockInfo) = .empty,
-    /// Called after anything the sidebar shows changed.
-    changed: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, m: *Machine) void } = null,
+    /// Called after sidebar data changes. A block ID means only its title changed.
+    changed: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, m: *Machine, title_block_id: ?[]const u8) void } = null,
     /// Called when a block's activity changes, such as a program becoming
     /// blocked on a question.
     activity: ?struct {
@@ -168,7 +168,7 @@ pub const Overview = struct {
     }
 
     fn notify(self: *Overview) void {
-        if (self.changed) |c| c.func(c.ctx, self.machine);
+        if (self.changed) |c| c.func(c.ctx, self.machine, null);
     }
 
     pub fn session(self: *const Overview, session_id: []const u8) ?*Session {
@@ -430,12 +430,11 @@ pub const Overview = struct {
 
     pub fn setTitle(self: *Overview, block_id: []const u8, title: []const u8) void {
         const info = self.blocks.getPtr(block_id) orelse return;
-        if (info.title) |t| {
-            if (std.mem.eql(u8, t, title)) return;
-            self.gpa.free(t);
-        }
-        info.title = self.gpa.dupe(u8, title) catch null;
-        self.notify();
+        if (info.title) |t| if (std.mem.eql(u8, t, title)) return;
+        const copy = self.gpa.dupe(u8, title) catch return;
+        if (info.title) |t| self.gpa.free(t);
+        info.title = copy;
+        if (self.changed) |c| c.func(c.ctx, self.machine, block_id);
     }
 
     pub fn setPwd(self: *Overview, block_id: []const u8, reported: []const u8) void {

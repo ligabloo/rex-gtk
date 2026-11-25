@@ -3,8 +3,8 @@
 //! can't be reached), a session heading with New Tab, then a row per tab with a
 //! tile, the tab's name and its working directory.
 //!
-//! The list is rebuilt from the machines' overviews whenever they change,
-//! from an idle callback so a burst of title changes rebuilds once.
+//! Overview changes rebuild the list from an idle callback. Terminal title
+//! changes update the existing labels in place to preserve row interaction.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,15 +19,20 @@ const ov = @import("overview.zig");
 
 const log = std.log.scoped(.sidebar);
 
-/// What a row stands for. Strings live in the sidebar's arena until the
-/// next rebuild.
+/// What a row stands for. IDs and window labels live in the sidebar arena.
 const Entry = struct {
     kind: enum { machine, session, tab },
     machine: *Machine,
     session_id: []const u8 = "",
     window_id: []const u8 = "",
-    /// Lowercase text the filter matches.
-    haystack: []const u8 = "",
+    tab: ?struct {
+        title_label: *gtk.Label,
+        window_label: []const u8,
+        focused_block_id: ?[]const u8,
+        /// Owned lowercase filter text. The suffix includes the detail and session name.
+        haystack: []u8,
+        title_len: usize,
+    } = null,
 };
 
 pub const Sidebar = struct {
@@ -119,8 +124,46 @@ pub const Sidebar = struct {
         while (it.next()) |kv| self.gpa.free(kv.key_ptr.*);
         self.collapsed_sessions.deinit(self.gpa);
         self.collapsed_machines.deinit(self.gpa);
+        self.clearEntries();
         self.entries.deinit(self.gpa);
         self.arena.deinit();
+    }
+
+    fn clearEntries(self: *Sidebar) void {
+        for (self.entries.items) |entry| {
+            if (entry.tab) |tab| self.gpa.free(tab.haystack);
+        }
+        self.entries.clearRetainingCapacity();
+    }
+
+    pub fn updateTitle(self: *Sidebar, machine: *Machine, block_id: []const u8) void {
+        // A queued rebuild will read the latest titles and may replace these rows.
+        if (self.rebuild_id != 0) return;
+        const block = machine.overview.block(block_id) orelse return;
+        var query_buf: [256]u8 = undefined;
+        const q = self.query(&query_buf);
+        var filter_changed = false;
+        for (self.entries.items) |*entry| {
+            if (entry.machine != machine) continue;
+            const tab = if (entry.tab) |*tab| tab else continue;
+            const focused = tab.focused_block_id orelse continue;
+            if (!std.mem.eql(u8, focused, block_id)) continue;
+            const title = ov.tabTitle(tab.window_label, block.title);
+            const haystack = std.fmt.allocPrint(self.gpa, "{s}{s}", .{ title, tab.haystack[tab.title_len..] }) catch continue;
+            _ = std.ascii.lowerString(haystack, haystack);
+            if (q.len != 0 and !filter_changed) {
+                filter_changed = matches(tab.haystack, q) != matches(haystack, q);
+            }
+            self.gpa.free(tab.haystack);
+            tab.haystack = haystack;
+            tab.title_len = title.len;
+
+            var buf: [512]u8 = undefined;
+            const label = std.fmt.bufPrintSentinel(&buf, "{s}", .{title}, 0) catch "Terminal";
+            if (!std.mem.eql(u8, std.mem.span(tab.title_label.getText()), label))
+                tab.title_label.setText(label);
+        }
+        if (filter_changed) self.list.invalidateFilter();
     }
 
     /// Rebuild soon. Cheap to call often.
@@ -140,7 +183,7 @@ pub const Sidebar = struct {
         self.syncing = true;
         defer self.syncing = false;
         self.list.removeAll();
-        self.entries.clearRetainingCapacity();
+        self.clearEntries();
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
 
@@ -149,7 +192,6 @@ pub const Sidebar = struct {
             self.append(self.machineRow(m), .{
                 .kind = .machine,
                 .machine = m,
-                .haystack = std.ascii.allocLowerString(a, m.title()) catch "",
             });
             if (m.state != .connected) continue;
             const machine_collapsed = self.collapsed_machines.contains(m);
@@ -160,7 +202,6 @@ pub const Sidebar = struct {
                     .kind = .session,
                     .machine = m,
                     .session_id = sid,
-                    .haystack = std.ascii.allocLowerString(a, name) catch "",
                 });
                 const info = m.overview.session(s.session_id) orelse continue;
                 for (info.windows.items) |w| {
@@ -175,14 +216,24 @@ pub const Sidebar = struct {
                         .working, .blocked, .@"error" => activity.text orelse pwd,
                         else => pwd,
                     };
-                    const hay = std.fmt.allocPrint(a, "{s} {s} {s}", .{ title, detail, name }) catch continue;
+                    const window_id = a.dupe(u8, w.window_id) catch continue;
+                    const window_label = a.dupe(u8, w.label) catch continue;
+                    const focused_block_id = if (w.focused_block_id) |id| a.dupe(u8, id) catch continue else null;
+                    const hay = std.fmt.allocPrint(self.gpa, "{s} {s} {s}", .{ title, detail, name }) catch continue;
                     _ = std.ascii.lowerString(hay, hay);
-                    self.append(tabRow(title, detail, activity), .{
+                    const tab = tabRow(title, detail, activity);
+                    self.append(tab.row, .{
                         .kind = .tab,
                         .machine = m,
                         .session_id = sid,
-                        .window_id = a.dupe(u8, w.window_id) catch continue,
-                        .haystack = hay,
+                        .window_id = window_id,
+                        .tab = .{
+                            .title_label = tab.title_label,
+                            .window_label = window_label,
+                            .focused_block_id = focused_block_id,
+                            .haystack = hay,
+                            .title_len = title.len,
+                        },
                     });
                 }
             }
@@ -191,7 +242,12 @@ pub const Sidebar = struct {
     }
 
     fn append(self: *Sidebar, row: *gtk.ListBoxRow, entry: Entry) void {
-        self.entries.append(self.gpa, entry) catch return;
+        self.entries.append(self.gpa, entry) catch {
+            if (entry.tab) |tab| self.gpa.free(tab.haystack);
+            _ = row.as(gobject.Object).refSink();
+            row.as(gobject.Object).unref();
+            return;
+        };
         self.list.append(row.as(gtk.Widget));
     }
 
@@ -272,7 +328,7 @@ pub const Sidebar = struct {
         return row;
     }
 
-    fn tabRow(title: []const u8, detail: []const u8, activity: ov.Summary) *gtk.ListBoxRow {
+    fn tabRow(title: []const u8, detail: []const u8, activity: ov.Summary) struct { row: *gtk.ListBoxRow, title_label: *gtk.Label } {
         const row = gtk.ListBoxRow.new();
         row.as(gtk.Widget).addCssClass("tab-row");
         const box = gtk.Box.new(.horizontal, 10);
@@ -308,7 +364,7 @@ pub const Sidebar = struct {
         box.append(text.as(gtk.Widget));
         if (activityMark(activity.state)) |mark| box.append(mark);
         row.setChild(box.as(gtk.Widget));
-        return row;
+        return .{ .row = row, .title_label = name };
     }
 
     /// What a tab's programs are doing, at the end of its row.
@@ -483,6 +539,10 @@ pub const Sidebar = struct {
         return std.ascii.lowerString(buf[0..n], text[0..n]);
     }
 
+    fn matches(haystack: []const u8, q: []const u8) bool {
+        return std.mem.indexOf(u8, haystack, q) != null;
+    }
+
     /// A tab shows if it matches; a heading if anything under it does.
     /// With no query, collapsed machines and sessions hide their children.
     fn filterRow(row: *gtk.ListBoxRow, data: ?*anyopaque) callconv(.c) c_int {
@@ -501,12 +561,12 @@ pub const Sidebar = struct {
             };
         }
         switch (e.kind) {
-            .tab => return @intFromBool(std.mem.indexOf(u8, e.haystack, q) != null),
+            .tab => return @intFromBool(matches(e.tab.?.haystack, q)),
             .session, .machine => {
                 for (self.entries.items[i + 1 ..]) |next| {
                     if (next.kind == .machine) break;
                     if (e.kind == .session and next.kind == .session) break;
-                    if (next.kind == .tab and std.mem.indexOf(u8, next.haystack, q) != null) return 1;
+                    if (next.kind == .tab and matches(next.tab.?.haystack, q)) return 1;
                 }
                 return 0;
             },
