@@ -163,10 +163,15 @@ pub const Renderer = struct {
                 .cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) },
                 .cursor_color = .{ 0, 0, 0, 0 },
                 .bg_color = .{ 0, 0, 0, 255 },
+                // Ghostty's default on Linux ("linear-corrected"): the
+                // shaders work in linear light and the sRGB target encodes
+                // the result once. Without it, colors were encoded twice
+                // and came out washed out.
                 .bools = .{
                     .cursor_wide = false,
                     .use_display_p3 = false,
-                    .use_linear_blending = false,
+                    .use_linear_blending = true,
+                    .use_linear_correction = true,
                 },
             },
         };

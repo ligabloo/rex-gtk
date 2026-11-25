@@ -261,8 +261,9 @@ pub const Keys = struct {
 
     /// Every key press in a terminal comes here first. Returns true if the
     /// key was used for a binding; false sends it to the terminal.
-    pub fn handle(self: *Keys, pane: *tv.Pane, keyval: u32, keycode: u32, state: gdk.ModifierType, event: *gdk.KeyEvent, repeat: bool) bool {
-        const display = pane.widgetPtr().getDisplay();
+    /// `pane` is the terminal the keys go to, if any: with none, as in an
+    /// empty session, bindings still run but nothing can be forwarded.
+    pub fn handle(self: *Keys, pane: ?*tv.Pane, display: *gdk.Display, keyval: u32, keycode: u32, state: gdk.ModifierType, event: *gdk.KeyEvent, repeat: bool) bool {
         const press: keymap.Press = .{
             .physical = input.keyName(keycode),
             .mods = .{ .shift = state.shift_mask, .ctrl = state.control_mask, .alt = state.alt_mask, .super = state.super_mask },
@@ -341,7 +342,7 @@ pub const Keys = struct {
         return false;
     }
 
-    fn run(self: *Keys, pane: *tv.Pane, b: keymap.Binding, repeat: bool) bool {
+    fn run(self: *Keys, pane: ?*tv.Pane, b: keymap.Binding, repeat: bool) bool {
         // The keys typed before this one, for client.key.forward.
         const had_prefix = self.prefix_names.items.len > 0;
         defer if (had_prefix) self.resetPrefix();
@@ -349,7 +350,7 @@ pub const Keys = struct {
         if (std.mem.eql(u8, b.action, "client.key.forward")) {
             // A key bound to a Lua function: send it to the server, which
             // runs the function.
-            if (had_prefix) pane.setKeyPrefix(self.prefix_names.items);
+            if (had_prefix) if (pane) |p| p.setKeyPrefix(self.prefix_names.items);
             return false;
         }
         if (repeat) {

@@ -39,8 +39,10 @@ pub const Header = struct {
     tab_bar: *adw.TabBar,
     content: *adw.ToolbarView,
     split: *adw.OverlaySplitView,
-    /// Extra buttons at the end, such as the main menu.
+    /// The palette button, at the end.
     end_box: *gtk.Box,
+    /// Only in the header bar layout: the sidebar has its own.
+    new_tab: *gtk.Button,
     layout: Layout = .sidebar,
     behavior: Behavior = .hover,
     hovering: bool = false,
@@ -141,6 +143,7 @@ pub const Header = struct {
             .content = content,
             .split = split,
             .end_box = end_box,
+            .new_tab = new_tab,
         };
 
         _ = gobject.Object.signals.notify.connect(split, *Header, &onSidebarShown, self, .{ .detail = "show-sidebar" });
@@ -173,6 +176,7 @@ pub const Header = struct {
         const header_tabs = self.layout == .header;
         self.toggle.as(gtk.Widget).setVisible(@intFromBool(!header_tabs));
         self.switcher.as(gtk.Widget).setVisible(@intFromBool(header_tabs));
+        self.new_tab.as(gtk.Widget).setVisible(@intFromBool(header_tabs));
         self.bar.setTitleWidget(if (header_tabs) self.tab_bar.as(gtk.Widget) else self.title.as(gtk.Widget));
         if (header_tabs) {
             self.split.setShowSidebar(0);

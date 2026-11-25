@@ -27,6 +27,7 @@ const actions = @import("actions.zig");
 const Keys = @import("keys.zig").Keys;
 const prompts = @import("prompts.zig");
 const keymap = @import("keymap.zig");
+const themes = @import("themes.zig");
 
 const log = std.log.scoped(.app);
 
@@ -102,6 +103,8 @@ pub const App = struct {
     session_option_used: bool = false,
     /// The Preferences window, while it's open.
     prefs: ?*Prefs = null,
+    /// Paints the window in the terminal theme's colors when asked.
+    tint_provider: ?*gtk.CssProvider = null,
 
     pub fn create(gpa: Allocator, io: std.Io, startup: Startup, options: Options) !*App {
         const self = try gpa.create(App);
@@ -374,7 +377,7 @@ pub const App = struct {
     /// was bound to an action, which then runs instead of typing.
     fn onShortcut(ctx: *anyopaque, pane: *tv.Pane, keyval: u32, keycode: u32, state: gdk.ModifierType, event: *gdk.KeyEvent, repeat: bool) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
-        return self.keys.handle(pane, keyval, keycode, state, event, repeat);
+        return self.keys.handle(pane, pane.widgetPtr().getDisplay(), keyval, keycode, state, event, repeat);
     }
 
     /// Key presses anywhere in the window, before the focused widget sees
@@ -387,13 +390,12 @@ pub const App = struct {
         // In a text field, only keys with Ctrl, Alt or Super can be ours.
         const typing = if (focus) |f| gobject.typeCheckInstanceIsA(@ptrCast(f), gtk.Text.getGObjectType()) != 0 else false;
         if (typing and !(state.control_mask or state.alt_mask or state.super_mask)) return 0;
-        // The keymap works on a pane: the shown tab's focused one.
-        const view = self.view orelse return 0;
-        const tab = view.selectedTab() orelse return 0;
-        const pane = view.focusedPane(tab) orelse return 0;
+        // The shown tab's focused pane, if there is one: an empty session
+        // still has shortcuts, such as Ctrl+, and New Tab.
+        const pane: ?*tv.Pane = if (self.view) |v| if (v.selectedTab()) |t| v.focusedPane(t) else null else null;
         const event = ctrl.as(gtk.EventController).getCurrentEvent() orelse return 0;
         const key_event = gobject.ext.cast(gdk.KeyEvent, event) orelse return 0;
-        return @intFromBool(self.keys.handle(pane, keyval, keycode, state, key_event, false));
+        return @intFromBool(self.keys.handle(pane, window.as(gtk.Widget).getDisplay(), keyval, keycode, state, key_event, false));
     }
 
     /// A key sequence or mode started or ended: show it in the title.
@@ -514,6 +516,7 @@ pub const App = struct {
             .dpi = @intFromFloat(96 * self.windowScale()),
         });
         self.applyColorScheme();
+        self.applyTint();
         errdefer fonts.destroy();
 
         self.services = .{
@@ -917,8 +920,9 @@ pub const App = struct {
             for (self.machines.items) |m| m.setClientLabel(label);
         } else if (eq(u8, key, "startup.start_server")) {
             self.localMachine().autostart = self.settings.getBool(key, true);
-        } else if (std.mem.startsWith(u8, key, "theme.")) {
+        } else if (std.mem.startsWith(u8, key, "theme.") or std.mem.eql(u8, key, "style.tint")) {
             if (self.view) |v| v.themeChanged();
+            self.applyTint();
         } else if (eq(u8, key, "style.scheme")) {
             self.applyColorScheme();
         } else if (eq(u8, key, "panes.dim")) {
@@ -1054,6 +1058,7 @@ pub const App = struct {
     fn onDarkChanged(sm: *adw.StyleManager, _: *gobject.ParamSpec, self: *App) callconv(.c) void {
         const services = if (self.services) |*s| s else return;
         services.dark = sm.getDark() != 0;
+        self.applyTint();
         if (self.view) |v| v.themeChanged();
     }
 
@@ -1139,7 +1144,14 @@ pub const App = struct {
         const page = adw.StatusPage.new();
         page.setIconName("utilities-terminal-symbolic");
         page.setTitle("Empty session");
-        page.setDescription("This session has no windows.");
+        page.setDescription("This session has no tabs.");
+        const button = gtk.Button.newWithLabel("New Tab");
+        button.as(gtk.Widget).addCssClass("pill");
+        button.as(gtk.Widget).addCssClass("suggested-action");
+        button.as(gtk.Widget).setHalign(.center);
+        button.as(gtk.Actionable).setActionName("app.rex");
+        button.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.tab.new"));
+        page.setChild(button.as(gtk.Widget));
         return page;
     }
 
@@ -1192,6 +1204,29 @@ pub const App = struct {
         // Focus it first, so the view we attach to shows it.
         m.send("session.focus_window", .{ .session_id = session_id, .window_id = window_id });
         self.switchSession(m, session_id);
+    }
+
+    /// Paint the window in the terminal theme's colors, or stop.
+    fn applyTint(self: *App) void {
+        const display = gdk.Display.getDefault() orelse return;
+        const provider = self.tint_provider orelse provider: {
+            const p = gtk.CssProvider.new();
+            // Above our own stylesheet and libadwaita's.
+            gtk.StyleContext.addProviderForDisplay(display, p.as(gtk.StyleProvider), gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+            self.tint_provider = p;
+            break :provider p;
+        };
+        const s = &self.settings;
+        if (!s.getBool("style.tint", false) or s.getBool("theme.use_config", false)) {
+            provider.loadFromString("");
+            return;
+        }
+        const dark = self.adw_app.getStyleManager().getDark() != 0;
+        const t = themes.forMode(s.getString(if (dark) "theme.dark" else "theme.light", ""), dark);
+        var buf: [2048]u8 = undefined;
+        const css = themes.tintCss(t, buf[0 .. buf.len - 1]);
+        buf[css.len] = 0;
+        provider.loadFromString(buf[0..css.len :0]);
     }
 
     fn loadCss(_: *App) void {

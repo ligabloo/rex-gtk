@@ -72,6 +72,65 @@ pub fn paletteArgs(t: *const Theme, buf: *[16][12]u8, out: *[16][]const u8) void
     }
 }
 
+pub const Rgb = [3]u8;
+
+pub fn parseRgb(hex: []const u8) Rgb {
+    const digits = if (hex.len > 0 and hex[0] == '#') hex[1..] else hex;
+    const v = std.fmt.parseInt(u24, digits, 16) catch 0;
+    return .{ @truncate(v >> 16), @truncate(v >> 8), @truncate(v) };
+}
+
+/// `a` moved `t` of the way towards `b`.
+pub fn mix(a: Rgb, b: Rgb, t: f32) Rgb {
+    var out: Rgb = undefined;
+    for (&out, a, b) |*o, x, y| {
+        const v = @as(f32, @floatFromInt(x)) + (@as(f32, @floatFromInt(y)) - @as(f32, @floatFromInt(x))) * t;
+        o.* = @intFromFloat(@round(std.math.clamp(v, 0, 255)));
+    }
+    return out;
+}
+
+fn hexOf(c: Rgb, buf: *[7]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ c[0], c[1], c[2] }) catch "#000000";
+}
+
+/// CSS that paints libadwaita's surfaces in a theme's colors: the window
+/// and header bar take the terminal's background, and the sidebar, cards,
+/// dialogs and popovers a shade towards its text color.
+pub fn tintCss(t: *const Theme, out: []u8) []const u8 {
+    const bg = parseRgb(t.background);
+    const fg = parseRgb(t.foreground);
+    var b: [6][7]u8 = undefined;
+    const bg_s = hexOf(bg, &b[0]);
+    const fg_s = hexOf(fg, &b[1]);
+    const sidebar = hexOf(mix(bg, fg, 0.04), &b[2]);
+    const dialog = hexOf(mix(bg, fg, 0.03), &b[3]);
+    const card = hexOf(mix(bg, fg, 0.07), &b[4]);
+    const popover = hexOf(mix(bg, fg, 0.06), &b[5]);
+    return std.fmt.bufPrint(out,
+        \\:root {{
+        \\  --window-bg-color: {0s}; --window-fg-color: {1s};
+        \\  --view-bg-color: {0s}; --view-fg-color: {1s};
+        \\  --headerbar-bg-color: {0s}; --headerbar-fg-color: {1s}; --headerbar-backdrop-color: {0s};
+        \\  --sidebar-bg-color: {2s}; --sidebar-fg-color: {1s}; --sidebar-backdrop-color: {2s};
+        \\  --secondary-sidebar-bg-color: {2s}; --secondary-sidebar-fg-color: {1s};
+        \\  --dialog-bg-color: {3s}; --dialog-fg-color: {1s};
+        \\  --card-bg-color: {4s}; --card-fg-color: {1s};
+        \\  --popover-bg-color: {5s}; --popover-fg-color: {1s};
+        \\}}
+        \\
+    , .{ bg_s, fg_s, sidebar, dialog, card, popover }) catch "";
+}
+
+test "tint css" {
+    try std.testing.expectEqual(Rgb{ 0x28, 0x28, 0x28 }, parseRgb("#282828"));
+    try std.testing.expectEqual(Rgb{ 128, 128, 128 }, mix(.{ 0, 0, 0 }, .{ 255, 255, 255 }, 0.5));
+    var buf: [2048]u8 = undefined;
+    const css = tintCss(find("nord").?, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, css, "--window-bg-color: #2e3440;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "--headerbar-fg-color: #d8dee9;") != null);
+}
+
 test "every theme is complete and well formed" {
     for (all) |t| {
         for (t.palette) |c| {

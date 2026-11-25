@@ -37,6 +37,9 @@ pub const AppearancePage = struct {
         const scheme = s.getString("style.scheme", "system");
         for (schemes, 0..) |name, i| if (std.mem.eql(u8, name, scheme)) style.setSelected(@intCast(i));
         look.add(style.as(gtk.Widget));
+        const tint = switchRow("Tint with theme", "Paint the window, header bar and sidebar in the terminal theme's colors.", s.getBool("style.tint", false));
+        win.bindSwitch(tint, &prefs.app.settings, "style.tint");
+        look.add(tint.as(gtk.Widget));
         body.add(look);
 
         const tabs = win.group("Tabs", null);
