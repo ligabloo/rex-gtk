@@ -9,7 +9,7 @@ Needs Zig 0.17.1 and the GTK 4, libadwaita, HarfBuzz, fontconfig, FreeType, epox
 xkbcommon development packages. On aerynOS:
 
 ```sh
-sudo moss install zig pkgconf glibc-devel gtk-4-devel libadwaita-devel graphene-devel \
+sudo moss pkg add zig pkgconf glibc-devel gtk-4-devel libadwaita-devel graphene-devel \
   harfbuzz-devel fontconfig-devel freetype-devel libepoxy-devel libglvnd-devel \
   mesa-libegl-devel mesa-libgl-devel libxkbcommon-devel
 ```
@@ -73,8 +73,15 @@ functions all work. Built-in shortcuts:
 zig build -Doptimize=ReleaseFast -Dtools=false --prefix ~/.local
 ```
 
-installs `rex-gtk`, its desktop entry, icon and AppStream metadata. An aerynOS recipe lives in
-the `aerynos-recipes` repo (`recipes/rex-gtk`).
+installs `rex-gtk`, its desktop entry, icon and AppStream metadata.
+
+On aerynOS it is also packaged in the
+[aerynos-recipes](https://github.com/ligabloo/aerynos-recipes) moss repo:
+
+```sh
+sudo moss repo add aerynos-recipes https://github.com/ligabloo/aerynos-recipes/releases/download/repo-x86_64/stone.index
+sudo moss pkg add rex-gtk
+```
 
 ## Tools
 
