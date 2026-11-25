@@ -21,6 +21,16 @@ zig build -Doptimize=ReleaseFast -Dtools=false --prefix ~/.local   # install
 - In debug builds: `kill -USR1` drops the control connection, `kill -USR2`
   drops every data stream (reconnect testing), `kill -TERM`/Ctrl+C quit cleanly.
 
+## Package releases
+
+Before publishing an AerynOS package or pushing the source and recipe for that
+release, build the candidate locally with Boulder and test it through a local
+Moss repository. In an isolated Moss root, install the current published
+version, sync to the candidate, and verify that Moss installed the expected
+version. Use the same source changes, package version, and release number that
+will be published. Fix any failures and repeat the test before publishing.
+See [Build and test a local AerynOS package](README.md#build-and-test-a-local-aerynos-package).
+
 ## Architecture
 
 Three module layers in build.zig, split so tests and headless tools never need

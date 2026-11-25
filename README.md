@@ -99,6 +99,79 @@ sudo moss repo add aerynos-recipes https://github.com/ligabloo/aerynos-recipes/r
 sudo moss pkg add rex-gtk
 ```
 
+### Build and test a local AerynOS package
+
+Before pushing a package release or publishing it, build the candidate locally and verify
+that Moss can upgrade from the current published version. Test the same source changes,
+package version, and release number you plan to publish.
+
+Run these commands from the rex-gtk checkout on AerynOS x86-64, with `boulder`, `moss`,
+and a sibling `../aerynos-recipes` checkout. If you haven't set up Boulder's `unstable`
+profile yet, add it once:
+
+```sh
+boulder profile add unstable --repo 'name=unstable,base-uri=https://cdn.aerynos.dev/,channel=main,version=stream/unstable,arch=x86_64'
+```
+
+Pick a candidate version higher than the baseline you're testing. The temporary checkout
+includes committed code and staged and unstaged changes to tracked files. Stage any new
+source files you want to include before taking the snapshot.
+
+```sh
+version=0.2.2
+work=$(mktemp -d /tmp/rex-gtk-package.XXXXXX)
+mkdir -p "$work/packages" "$work/repo" "$work/root" "$work/cache"
+
+git clone --no-local . "$work/source"
+git diff --binary HEAD > "$work/working-tree.patch"
+if [ -s "$work/working-tree.patch" ]; then
+    git -C "$work/source" apply "$work/working-tree.patch"
+fi
+git -C "$work/source" add -A
+git -C "$work/source" -c user.name='Local Build' -c user.email='local-build@localhost' \
+    commit --allow-empty -m 'stage local package build'
+revision=$(git -C "$work/source" rev-parse HEAD)
+
+sed -e "s/^version .*/version     : \"$version\"/" \
+    -e 's/^release .*/release     : 1/' \
+    -e "s|^    - git.*|    - git\|file://$work/source : $revision|" \
+    ../aerynos-recipes/recipes/rex-gtk/stone.yaml > "$work/stone.yaml"
+boulder build -y -p unstable -o "$work/packages" "$work/stone.yaml"
+```
+
+The candidate `.stone` is in `"$work/packages"`. The recipe sets the Moss package version.
+Update the app's version and AppStream metadata in the snapshot before committing it if
+you're also testing those displays.
+
+To test an upgrade, set `baseline` to an existing rex-gtk `.stone` from an older build or
+the [Moss release](https://github.com/ligabloo/aerynos-recipes/releases/tag/repo-x86_64).
+Run the following in the same shell. The test uses a separate Moss root and cache, with
+the AerynOS repository enabled for dependencies.
+
+```sh
+baseline=/absolute/path/to/rex-gtk-0.2.1-1-1-x86_64.stone
+test_moss() { moss -D "$work/root" --cache-dir "$work/cache" "$@"; }
+
+cp "$baseline" "$work/repo/"
+moss index -i "$work/repo"
+test_moss repo add rex-gtk-local "file://$work/repo/stone.index"
+test_moss repo add unstable https://cdn.aerynos.dev/ \
+    --root-index channel=main,version=stream/unstable,arch=x86_64
+test_moss repo update
+test_moss -y pkg add rex-gtk
+
+mv "$work/repo/$(basename "$baseline")" "$work/"
+cp "$work/packages/rex-gtk-$version-1-1-x86_64.stone" "$work/repo/"
+moss index -i "$work/repo"
+test_moss repo update rex-gtk-local
+test_moss sync --dry-run
+test_moss -y sync
+test_moss pkg list --installed | rg '^rex-gtk'
+```
+
+The dry run should show rex-gtk upgrading to the candidate version. Keep only one
+rex-gtk package in the indexed directory when both versions use release `1`.
+
 ## Tools
 
 - `rexcat BLOCK [--follow MS] [--record FILE]`: attach to a terminal headlessly and print it;
