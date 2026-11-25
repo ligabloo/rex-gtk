@@ -18,6 +18,7 @@ const render = @import("render");
 const Client = @import("client.zig").Client;
 const Stream = @import("stream.zig").Stream;
 const input = @import("input.zig");
+const mouse = @import("mouse.zig");
 
 const ghostty_vt = core.ghostty_vt;
 const Mirror = core.mirror.Mirror;
@@ -40,6 +41,8 @@ pub const Services = struct {
     dump_frame: ?[]const u8 = null,
     /// Whether the desktop uses a dark style. See `pushTheme`.
     dark: bool = true,
+    /// For desktop notifications.
+    app: ?*@import("gio").Application = null,
 };
 
 const Theme = struct {
@@ -95,6 +98,8 @@ pub const Pane = struct {
     /// Our event controllers on the widget, removed in `destroy`: GTK may
     /// keep the widget alive (and send it events) after the pane is gone.
     controllers: std.ArrayList(*gtk.EventController) = .empty,
+    /// Mouse, selection and scrolling state; see mouse.zig.
+    pointer: mouse.State = .{},
 
     /// Called when the program in the block has exited.
     on_exit: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, pane: *Pane) void } = null,
@@ -143,6 +148,7 @@ pub const Pane = struct {
         if (self.tick_id != 0) self.widget.as(gtk.Widget).removeTickCallback(self.tick_id);
         if (self.blink_id != 0) _ = glib.Source.remove(self.blink_id);
         if (self.stream) |s| s.destroy();
+        self.pointer.deinit(if (self.mirror) |m| &m.terminal else null);
         if (self.mirror) |m| m.destroy();
 
         gdk.GLContext.clearCurrent();
@@ -216,7 +222,10 @@ pub const Pane = struct {
         const had_exited = mirror.exit_code != null;
         mirror.feed(bytes) catch |err| log.warn("applying stream bytes failed: {}", .{err});
         self.markDirty();
-        if (!had_exited and mirror.exit_code != null) if (self.on_exit) |cb| cb.func(cb.ctx, self);
+        if (!had_exited and mirror.exit_code != null) {
+            self.widget.as(gtk.Widget).queueDraw();
+            if (self.on_exit) |cb| cb.func(cb.ctx, self);
+        }
     }
 
     fn onStreamEnded(ctx: *anyopaque, close_code: ?u16) void {
@@ -415,9 +424,7 @@ pub const Pane = struct {
         _ = gtk.EventControllerFocus.signals.leave.connect(focus, *Pane, &onFocusLeave, self, .{});
         self.addController(focus.as(gtk.EventController));
 
-        const click = gtk.GestureClick.new();
-        _ = gtk.GestureClick.signals.pressed.connect(click, *Pane, &onClick, self, .{});
-        self.addController(click.as(gtk.EventController));
+        mouse.setup(self);
 
         const im = self.im.as(gtk.IMContext);
         im.setClientWidget(widget);
@@ -426,17 +433,47 @@ pub const Pane = struct {
         _ = gtk.IMContext.signals.preedit_end.connect(im, *Pane, &onPreeditEnd, self, .{});
     }
 
-    fn addController(self: *Pane, c: *gtk.EventController) void {
+    pub fn addController(self: *Pane, c: *gtk.EventController) void {
         self.widget.as(gtk.Widget).addController(c);
         self.controllers.append(self.services.gpa, c) catch {};
     }
 
-    fn onClick(_: *gtk.GestureClick, _: c_int, _: f64, _: f64, self: *Pane) callconv(.c) void {
-        _ = self.widget.as(gtk.Widget).grabFocus();
+    /// A click on this pane: make it the focused block on the server.
+    pub fn focusOnServer(self: *Pane) void {
         if (!self.server_focused) self.services.client.send("session.focus_block", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
         });
+    }
+
+    /// The selection or viewport changed locally: redraw.
+    pub fn selectionChanged(self: *Pane) void {
+        self.renderer.invalidate();
+        self.markDirty();
+    }
+
+    /// Send text as a paste. The server adds bracketed-paste markers if
+    /// the program asked for them.
+    pub fn paste(self: *Pane, text: []const u8) void {
+        if (text.len == 0) return;
+        mouse.scrollToBottom(self);
+        self.services.client.send("block.event", .{
+            .session_id = self.session_id,
+            .block_id = self.block_id,
+            .event = .{ .type = "paste", .payload = .{ .text = text } },
+        });
+    }
+
+    /// Ctrl+Shift+C and Ctrl+Shift+V. Returns true if the key was one.
+    fn clipboardShortcut(self: *Pane, keyval: u32, state: gdk.ModifierType) bool {
+        if (!state.control_mask or !state.shift_mask or state.alt_mask or state.super_mask) return false;
+        const widget = self.widget.as(gtk.Widget);
+        switch (gdk.keyvalToLower(keyval)) {
+            'c' => mouse.copyTo(self, widget.getClipboard()),
+            'v' => mouse.pasteFrom(self, widget.getClipboard()),
+            else => return false,
+        }
+        return true;
     }
 
     fn onKeyPressed(ctrl: *gtk.EventControllerKey, keyval: c_uint, keycode: c_uint, state: gdk.ModifierType, self: *Pane) callconv(.c) c_int {
@@ -450,6 +487,7 @@ pub const Pane = struct {
     fn keyEvent(self: *Pane, ctrl: *gtk.EventControllerKey, press: bool, keyval: u32, keycode: u32, state: gdk.ModifierType) bool {
         const gpa = self.services.gpa;
         const event = ctrl.as(gtk.EventController).getCurrentEvent() orelse return false;
+        if (press and self.clipboardShortcut(keyval, state)) return true;
 
         // Give the input method the first look. It may commit text (sent
         // with this key), start a composition, or eat the key.
@@ -506,8 +544,9 @@ pub const Pane = struct {
             },
         });
 
-        // Typing shows the cursor right away.
+        // Typing shows the cursor right away, and returns to the bottom.
         self.restartBlink();
+        if (press) mouse.scrollToBottom(self);
         return true;
     }
 
@@ -627,7 +666,7 @@ pub const TerminalWidget = extern struct {
     }
 
     /// The widget's scale: device pixels per CSS pixel.
-    fn scale(self: *TerminalWidget) f64 {
+    pub fn scale(self: *TerminalWidget) f64 {
         const widget = self.as(gtk.Widget);
         if (widget.getNative()) |native| if (native.getSurface()) |surface| {
             const s = surface.getScale();
@@ -647,6 +686,11 @@ pub const TerminalWidget = extern struct {
     }
 
     fn snapshot(self: *TerminalWidget, snap: *gtk.Snapshot) callconv(.c) void {
+        self.snapshotTexture(snap);
+        self.snapshotOverlay(snap);
+    }
+
+    fn snapshotTexture(self: *TerminalWidget, snap: *gtk.Snapshot) void {
         const texture = self.texture orelse return;
         const s: f32 = @floatCast(self.scale());
         const w: f32 = @as(f32, @floatFromInt(texture.getWidth())) / s;
@@ -661,6 +705,38 @@ pub const TerminalWidget = extern struct {
             .f_origin = .{ .f_x = 0, .f_y = 0 },
             .f_size = .{ .f_width = w, .f_height = h },
         });
+    }
+
+    /// The pane's own drawing on top of the terminal: a note once the
+    /// program has exited.
+    fn snapshotOverlay(self: *TerminalWidget, snap: *gtk.Snapshot) void {
+        const pane = self.pane orelse return;
+        const code = pane.exitCode() orelse return;
+        const widget = self.as(gtk.Widget);
+        const W: f32 = @floatFromInt(widget.getWidth());
+        const H: f32 = @floatFromInt(widget.getHeight());
+        var rect: @import("graphene").Rect = undefined;
+        _ = rect.init(0, 0, W, H);
+        const dark = pane.services.dark;
+        const shade: gdk.RGBA = if (dark)
+            .{ .f_red = 0, .f_green = 0, .f_blue = 0, .f_alpha = 0.45 }
+        else
+            .{ .f_red = 1, .f_green = 1, .f_blue = 1, .f_alpha = 0.55 };
+        snap.appendColor(&shade, &rect);
+
+        var buf: [96]u8 = undefined;
+        const text = std.fmt.bufPrintSentinel(&buf, "Process exited with status {d}", .{code}, 0) catch return;
+        const layout = widget.createPangoLayout(text);
+        defer layout.as(gobject.Object).unref();
+        var lw: c_int = 0;
+        var lh: c_int = 0;
+        layout.getPixelSize(&lw, &lh);
+        var fg: gdk.RGBA = undefined;
+        widget.getColor(&fg);
+        snap.save();
+        defer snap.restore();
+        snap.translate(&.{ .f_x = (W - @as(f32, @floatFromInt(lw))) / 2, .f_y = H - @as(f32, @floatFromInt(lh)) - 16 });
+        snap.appendLayout(layout, &fg);
     }
 
     fn map(self: *TerminalWidget) callconv(.c) void {

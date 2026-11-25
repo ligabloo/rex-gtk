@@ -248,6 +248,7 @@ pub const App = struct {
             .fonts = fonts,
             .dump_frame = self.options.dump_frame,
             .dark = self.adw_app.getStyleManager().getDark() != 0,
+            .app = self.adw_app.as(gio.Application),
         };
         _ = gobject.Object.signals.notify.connect(
             self.adw_app.getStyleManager(),

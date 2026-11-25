@@ -18,6 +18,8 @@ const api = @import("api.zig");
 const Incoming = @import("client.zig").Incoming;
 const LayoutWidget = @import("layout_view.zig").LayoutWidget;
 const Placement = @import("layout_view.zig").Placement;
+const mouse = @import("mouse.zig");
+const gio = @import("gio");
 
 const Pane = tv.Pane;
 const log = std.log.scoped(.session_view);
@@ -565,9 +567,98 @@ pub const SessionView = struct {
         } else if (std.mem.eql(u8, name, "bell")) {
             const tab = self.tabShowing(b) orelse return;
             if (self.selectedTab() != tab) tab.page.setNeedsAttention(1);
+            if (b.pane) |pane| pane.widgetPtr().errorBell();
+        } else if (std.mem.eql(u8, name, "url_clicked")) {
+            const p = api.parseValue(struct { url: []const u8 }, msg, payload) orelse return;
+            if (b.pane) |pane| mouse.openUrl(pane, p.url);
+        } else if (std.mem.eql(u8, name, "clipboard_written")) {
+            const p = api.parseValue(struct { text: ?[]const u8 = null, id: ?u64 = null, bytes: u64 = 0 }, msg, payload) orelse return;
+            const pane = b.pane orelse return;
+            if (p.text) |text| {
+                setClipboard(pane, text);
+            } else if (p.bytes > 0) {
+                self.readClipboard(block_id, p.id orelse 0);
+            }
+        } else if (std.mem.eql(u8, name, "desktop_notification")) {
+            const p = api.parseValue(struct { title: []const u8 = "", body: []const u8 = "" }, msg, payload) orelse return;
+            self.notify(p.title, p.body);
         } else {
             log.debug("block event {s} for {s}", .{ name, block_id });
         }
+    }
+
+    fn setClipboard(pane: *Pane, text: []const u8) void {
+        const gpa = pane.services.gpa;
+        const z = gpa.dupeSentinel(u8, text, 0) catch return;
+        defer gpa.free(z);
+        pane.widgetPtr().getClipboard().setText(z);
+        log.debug("a program copied {d} bytes to the clipboard", .{text.len});
+    }
+
+    /// A copy too large for its event: read it with clipboard_read, in parts.
+    const ClipboardRead = struct {
+        view: *SessionView,
+        block_id: []u8,
+        id: u64,
+        text: std.ArrayList(u8) = .empty,
+    };
+
+    fn readClipboard(self: *SessionView, block_id: []const u8, id: u64) void {
+        const req = self.gpa.create(ClipboardRead) catch return;
+        req.* = .{ .view = self, .block_id = self.gpa.dupe(u8, block_id) catch {
+            self.gpa.destroy(req);
+            return;
+        }, .id = id };
+        self.readClipboardPart(req);
+    }
+
+    fn readClipboardPart(self: *SessionView, req: *ClipboardRead) void {
+        self.outstanding += 1;
+        self.services.client.call("com.superlogical.terminal.clipboard_read", .{
+            .session_id = self.session_id,
+            .block_id = req.block_id,
+            .args = .{ .id = req.id, .offset = req.text.items.len, .max_bytes = 983040 },
+        }, req, &onClipboardPart);
+    }
+
+    fn onClipboardPart(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
+        const req: *ClipboardRead = @ptrCast(@alignCast(ctx.?));
+        const self = req.view;
+        const gpa = self.gpa;
+        var done = true;
+        defer if (done) {
+            req.text.deinit(gpa);
+            gpa.free(req.block_id);
+            gpa.destroy(req);
+        };
+        const msg = maybe_msg orelse {
+            _ = self.finish();
+            return;
+        };
+        defer msg.deinit();
+        if (!self.finish()) return;
+        const res = api.parse(struct { id: u64, data: []const u8, eof: bool }, msg) orelse return;
+        req.id = res.id;
+        req.text.appendSlice(gpa, res.data) catch return;
+        if (!res.eof and res.data.len > 0) {
+            done = false;
+            return self.readClipboardPart(req);
+        }
+        const b = self.blocks.get(req.block_id) orelse return;
+        if (b.pane) |pane| setClipboard(pane, req.text.items);
+    }
+
+    fn notify(self: *SessionView, title: []const u8, body: []const u8) void {
+        const app = self.services.app orelse return;
+        const gpa = self.gpa;
+        const t = gpa.dupeSentinel(u8, if (title.len > 0) title else "Terminal", 0) catch return;
+        defer gpa.free(t);
+        const b = gpa.dupeSentinel(u8, body, 0) catch return;
+        defer gpa.free(b);
+        const n = gio.Notification.new(t);
+        defer n.as(gobject.Object).unref();
+        n.setBody(b);
+        app.sendNotification(null, n);
     }
 
     fn tabShowing(self: *SessionView, b: *Block) ?*Tab {

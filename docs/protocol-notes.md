@@ -47,3 +47,18 @@ highlight from server state.
 
 rex-gtk therefore selects locally (Ghostty's `SelectionGesture` on the mirror) and forwards mouse
 events only while the program has turned on mouse reporting and Shift isn't held.
+
+## Terminal block events
+
+`/api/help` doesn't list block events; `block_creator.list` does, under each creator's
+`api.events`. The ones rex-gtk handles:
+
+- `title_changed` `{title}`.
+- `bell` `{}`.
+- `clipboard_written` `{text?, id?, bytes?}`: OSC 52. Without `text` but with `bytes > 0`, read
+  the copy with `com.superlogical.terminal.clipboard_read` `{id, offset, max_bytes}` until `eof`.
+  A 266 KB copy arrived without text and read back correctly in one call.
+- `url_clicked` `{url}`: the server never opens links itself.
+- `desktop_notification` `{title, body}`: OSC 9 and OSC 777.
+- `selection_copied`: only for server-side selection, which rex-gtk doesn't use.
+- Also sent: `size_changed`, `process_changed`, `pwd_changed`, `ports_changed`, `progress_report`.

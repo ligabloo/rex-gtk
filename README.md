@@ -29,6 +29,12 @@ The window shows the server's sessions in a sidebar (toggle it with the button a
 and the selected session's windows as tabs. Splits, zoom and floating layers follow the server's
 view, so changes made with the `rex` CLI or another app show up live.
 
+Mouse: drag to select (double-click for a word, triple-click for a line); selecting copies to
+the primary selection, and middle-click pastes it. Ctrl+Shift+C and Ctrl+Shift+V copy and paste
+with the clipboard, and Ctrl+click opens a URL. The wheel scrolls back through the terminal's
+history; typing returns to the bottom. When a program asks for the mouse (htop, vim with
+`mouse=a`) events go to it instead; hold Shift to select text anyway.
+
 ## Tools
 
 - `rexcat BLOCK [--follow MS] [--record FILE]`: attach to a terminal headlessly and print it;
