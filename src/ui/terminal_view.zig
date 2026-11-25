@@ -43,6 +43,11 @@ pub const Services = struct {
     dark: bool = true,
     /// For desktop notifications.
     app: ?*@import("gio").Application = null,
+    /// Gets every key press first; returns true if it was a shortcut.
+    shortcut: ?struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, pane: *Pane, keyval: u32, keycode: u32, state: gdk.ModifierType, event: *gdk.KeyEvent, repeat: bool) bool,
+    } = null,
 };
 
 const Theme = struct {
@@ -81,6 +86,8 @@ pub const Pane = struct {
     server_focused: bool = false,
     /// The title the program set, if any.
     title: ?[]u8 = null,
+    /// The working directory the shell reported, if any.
+    pwd: ?[]u8 = null,
     /// Called when the title changes.
     on_title: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, pane: *Pane) void } = null,
 
@@ -168,9 +175,29 @@ pub const Pane = struct {
         self.im_commit.deinit(gpa);
         self.pressed.deinit(gpa);
         if (self.title) |t| gpa.free(t);
+        if (self.pwd) |d| gpa.free(d);
         gpa.free(self.session_id);
         gpa.free(self.block_id);
         gpa.destroy(self);
+    }
+
+    /// The font changed (`services.fonts` is new): rebuild the renderer.
+    pub fn fontsChanged(self: *Pane) void {
+        const gpu = self.services.gpu;
+        gdk.GLContext.clearCurrent();
+        gpu.makeCurrent() catch return;
+        defer gpu.release();
+        const renderer = Renderer.init(self.services.gpa, gpu, self.services.fonts, .{}) catch |err| {
+            log.err("rebuilding the renderer failed: {}", .{err});
+            return;
+        };
+        self.renderer.deinit();
+        self.renderer = renderer;
+        self.renderer.focused = self.focused;
+        self.requested_cols = 0;
+        self.requested_rows = 0;
+        self.requestGridSize();
+        self.markDirty();
     }
 
     /// Whether we own the block. Taking it over sizes the terminal to this
@@ -193,6 +220,33 @@ pub const Pane = struct {
         }
         self.title = gpa.dupe(u8, title) catch null;
         if (self.on_title) |cb| cb.func(cb.ctx, self);
+    }
+
+    /// From `pwd_changed`: a file:// URL (OSC 7) or a plain path.
+    pub fn setPwd(self: *Pane, reported: []const u8) void {
+        const gpa = self.services.gpa;
+        var path = reported;
+        if (std.mem.startsWith(u8, path, "file://")) {
+            const rest = path["file://".len..];
+            path = if (std.mem.indexOfScalar(u8, rest, '/')) |i| rest[i..] else return;
+        }
+        const copy = gpa.dupe(u8, path) catch return;
+        // Undo percent-encoding in place.
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < copy.len) : (n += 1) {
+            if (copy[i] == '%' and i + 2 < copy.len) {
+                if (std.fmt.parseInt(u8, copy[i + 1 .. i + 3], 16)) |b| {
+                    copy[n] = b;
+                    i += 3;
+                    continue;
+                } else |_| {}
+            }
+            copy[n] = copy[i];
+            i += 1;
+        }
+        if (self.pwd) |old| gpa.free(old);
+        self.pwd = gpa.realloc(copy, n) catch copy[0..n];
     }
 
     pub fn exitCode(self: *const Pane) ?i64 {
@@ -464,17 +518,7 @@ pub const Pane = struct {
         });
     }
 
-    /// Ctrl+Shift+C and Ctrl+Shift+V. Returns true if the key was one.
-    fn clipboardShortcut(self: *Pane, keyval: u32, state: gdk.ModifierType) bool {
-        if (!state.control_mask or !state.shift_mask or state.alt_mask or state.super_mask) return false;
-        const widget = self.widget.as(gtk.Widget);
-        switch (gdk.keyvalToLower(keyval)) {
-            'c' => mouse.copyTo(self, widget.getClipboard()),
-            'v' => mouse.pasteFrom(self, widget.getClipboard()),
-            else => return false,
-        }
-        return true;
-    }
+
 
     fn onKeyPressed(ctrl: *gtk.EventControllerKey, keyval: c_uint, keycode: c_uint, state: gdk.ModifierType, self: *Pane) callconv(.c) c_int {
         return @intFromBool(self.keyEvent(ctrl, true, keyval, keycode, state));
@@ -487,7 +531,10 @@ pub const Pane = struct {
     fn keyEvent(self: *Pane, ctrl: *gtk.EventControllerKey, press: bool, keyval: u32, keycode: u32, state: gdk.ModifierType) bool {
         const gpa = self.services.gpa;
         const event = ctrl.as(gtk.EventController).getCurrentEvent() orelse return false;
-        if (press and self.clipboardShortcut(keyval, state)) return true;
+        const key_event = gobject.ext.cast(gdk.KeyEvent, event) orelse return false;
+        if (press) if (self.services.shortcut) |sc| {
+            if (sc.func(sc.ctx, self, keyval, keycode, state, key_event, self.pressed.contains(keycode))) return true;
+        };
 
         // Give the input method the first look. It may commit text (sent
         // with this key), start a composition, or eat the key.
@@ -498,14 +545,14 @@ pub const Pane = struct {
         if (press and (self.composing or (im_handled and self.im_commit.items.len == 0))) return true;
 
         const action: []const u8 = if (!press) action: {
-            _ = self.pressed.remove(keycode);
+            // Releases of keys we never sent (shortcuts) stay here.
+            if (!self.pressed.remove(keycode)) return false;
             break :action "release";
         } else if (self.pressed.contains(keycode)) "repeat" else action: {
             self.pressed.put(gpa, keycode, {}) catch {};
             break :action "press";
         };
 
-        const key_event = gobject.ext.cast(gdk.KeyEvent, event) orelse return false;
         const consumed = key_event.getConsumedModifiers();
         var mods_buf: [64]u8 = undefined;
         var consumed_buf: [64]u8 = undefined;

@@ -16,6 +16,9 @@ const Incoming = @import("client.zig").Incoming;
 const tv = @import("terminal_view.zig");
 const api = @import("api.zig");
 const SessionView = @import("session_view.zig").SessionView;
+const actions = @import("actions.zig");
+const keymap = @import("keymap.zig");
+const input = @import("input.zig");
 
 const log = std.log.scoped(.app);
 
@@ -50,6 +53,12 @@ pub const App = struct {
     content: ?*adw.ToolbarView = null,
     tab_bar: ?*adw.TabBar = null,
     session_list: ?*gtk.ListBox = null,
+    split_view: ?*adw.OverlaySplitView = null,
+
+    /// The terminal font size in points; starts at `options.font_size`.
+    font_size: f32 = 11,
+    /// The key bindings in effect, top of each key's stack first.
+    bindings: []const keymap.Binding = &keymap.defaults,
 
     services: ?tv.Services = null,
     /// The sessions in the sidebar, in the server's order.
@@ -67,6 +76,7 @@ pub const App = struct {
             .options = options,
             .socket_path = socket_path,
             .adw_app = adw.Application.new(app_id, .{ .non_unique = true }),
+            .font_size = options.font_size,
         };
         _ = gio.Application.signals.activate.connect(self.adw_app, *App, &onActivate, self, .{});
         _ = gio.Application.signals.shutdown.connect(self.adw_app, *App, &onShutdown, self, .{});
@@ -117,6 +127,12 @@ pub const App = struct {
         toggle.as(gtk.Button).setIconName("sidebar-show-symbolic");
         toggle.as(gtk.Widget).setTooltipText("Sessions");
         header.packStart(toggle.as(gtk.Widget));
+        header.packEnd(self.primaryMenu().as(gtk.Widget));
+        const new_tab = gtk.Button.newFromIconName("tab-new-symbolic");
+        new_tab.as(gtk.Widget).setTooltipText("New Tab");
+        new_tab.as(gtk.Actionable).setActionName("app.rex");
+        new_tab.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.tab.new"));
+        header.packEnd(new_tab.as(gtk.Widget));
 
         const tab_bar = adw.TabBar.new();
         tab_bar.setAutohide(1);
@@ -131,6 +147,7 @@ pub const App = struct {
         split.setSidebar(sidebar.as(gtk.Widget));
         split.setContent(content.as(gtk.Widget));
         split.setShowSidebar(0);
+        self.split_view = split;
         _ = split.as(gobject.Object).bindProperty("show-sidebar", toggle.as(gobject.Object), "active", .{
             .bidirectional = true,
             .sync_create = true,
@@ -145,6 +162,97 @@ pub const App = struct {
             log.err("startup failed: {}", .{err});
             self.showStatus("dialog-error-symbolic", "Can't connect to Rex", @errorName(err));
         };
+    }
+
+    /// The menu behind the header bar's menu button. Each item performs a
+    /// Rex action through the "app.rex" action.
+    fn primaryMenu(self: *App) *gtk.MenuButton {
+        const rex_action = gio.SimpleAction.new("rex", glib.VariantType.new("s"));
+        _ = gio.SimpleAction.signals.activate.connect(rex_action, *App, &onRexAction, self, .{});
+        self.adw_app.as(gio.ActionMap).addAction(rex_action.as(gio.Action));
+
+        const sections = [_][]const [2][:0]const u8{
+            &.{ .{ "New Tab", "client.tab.new" }, .{ "New Session", "session.new" } },
+            &.{ .{ "Split Right", "pane.split.right" }, .{ "Split Down", "pane.split.down" }, .{ "Zoom Pane", "pane.zoom" }, .{ "Float Pane", "pane.float" }, .{ "Close Pane", "pane.close" } },
+            &.{ .{ "Rename Tab…", "client.tab.rename" }, .{ "Rename Pane…", "pane.rename" }, .{ "Rename Session…", "session.rename" }, .{ "Close Session…", "session.close" } },
+            &.{ .{ "Toggle Sidebar", "client.sidebar.toggle" }, .{ "Full Screen", "client.window.fullscreen.toggle" } },
+        };
+        const menu = gio.Menu.new();
+        inline for (sections) |items| {
+            const section = gio.Menu.new();
+            for (items) |item| {
+                const mi = gio.MenuItem.new(item[0], null);
+                mi.setActionAndTargetValue("app.rex", glib.Variant.newString(item[1]));
+                section.appendItem(mi);
+                mi.as(gobject.Object).unref();
+            }
+            menu.appendSection(null, section.as(gio.MenuModel));
+            section.as(gobject.Object).unref();
+        }
+        const button = gtk.MenuButton.new();
+        button.setIconName("open-menu-symbolic");
+        button.setMenuModel(menu.as(gio.MenuModel));
+        button.as(gtk.Widget).setTooltipText("Main Menu");
+        menu.as(gobject.Object).unref();
+        return button;
+    }
+
+    fn onRexAction(_: *gio.SimpleAction, param: ?*glib.Variant, self: *App) callconv(.c) void {
+        const p = param orelse return;
+        actions.run(self, std.mem.span(p.getString(null)), .null);
+    }
+
+    pub fn toggleSidebar(self: *App) void {
+        const split = self.split_view orelse return;
+        split.setShowSidebar(@intFromBool(split.getShowSidebar() == 0));
+    }
+
+    /// Change the terminal font size for every pane.
+    pub fn setFontSize(self: *App, points: f32) void {
+        const services = if (self.services) |*s| s else return;
+        if (points == self.font_size) return;
+        const fonts = render.fonts.Fonts.create(self.gpa, .{
+            .family = self.options.font_family,
+            .size_points = points,
+            .dpi = @intFromFloat(96 * self.windowScale()),
+        }) catch |err| {
+            log.err("loading the font at {d}pt failed: {}", .{ points, err });
+            return;
+        };
+        const old = services.fonts;
+        services.fonts = fonts;
+        self.font_size = points;
+        if (self.view) |v| v.fontsChanged();
+        old.destroy();
+    }
+
+    /// Every key press in a terminal comes here first. Returns true if it
+    /// was bound to an action, which then runs instead of typing.
+    fn onShortcut(ctx: *anyopaque, pane: *tv.Pane, keyval: u32, keycode: u32, state: gdk.ModifierType, event: *gdk.KeyEvent, repeat: bool) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const display = pane.widgetPtr().getDisplay();
+        const press: keymap.Press = .{
+            .physical = input.keyName(keycode),
+            .mods = .{ .shift = state.shift_mask, .ctrl = state.control_mask, .alt = state.alt_mask, .super = state.super_mask },
+            .unshifted = @intCast(input.unshiftedCodepoint(display, keycode, event.getLayout())),
+            .shifted = @intCast(gdk.keyvalToUnicode(keyval)),
+        };
+        for (self.bindings) |b| {
+            if (b.keys.len != 1 or b.mode != null) continue;
+            const key = keymap.Key.parse(b.keys[0]) orelse continue;
+            if (!key.matches(press)) continue;
+            const action = actions.find(b.action) orelse continue;
+            if (repeat and !action.repeats) return true;
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena.deinit();
+            const args: std.json.Value = if (b.args) |a|
+                std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), a, .{}) catch .null
+            else
+                .null;
+            actions.run(self, action.name, args);
+            return true;
+        }
+        return false;
     }
 
     /// Debugging aid (--screenshot): render the window to a PNG.
@@ -249,6 +357,7 @@ pub const App = struct {
             .dump_frame = self.options.dump_frame,
             .dark = self.adw_app.getStyleManager().getDark() != 0,
             .app = self.adw_app.as(gio.Application),
+            .shortcut = .{ .ctx = self, .func = onShortcut },
         };
         _ = gobject.Object.signals.notify.connect(
             self.adw_app.getStyleManager(),
@@ -274,7 +383,7 @@ pub const App = struct {
         return @floatFromInt(@max(1, s));
     }
 
-    fn rex(self: *App) *Client {
+    pub fn rex(self: *App) *Client {
         return self.services.?.client;
     }
 
@@ -358,7 +467,7 @@ pub const App = struct {
     }
 
     /// Switch to another session: detach from the one shown, attach to it.
-    fn switchSession(self: *App, session_id: []const u8) void {
+    pub fn switchSession(self: *App, session_id: []const u8) void {
         if (self.view) |v| if (std.mem.eql(u8, v.session_id, session_id)) return;
         const view = self.showSession(session_id) orelse return;
         self.updateTitle();

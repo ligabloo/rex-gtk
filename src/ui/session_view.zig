@@ -18,6 +18,7 @@ const api = @import("api.zig");
 const Incoming = @import("client.zig").Incoming;
 const LayoutWidget = @import("layout_view.zig").LayoutWidget;
 const Placement = @import("layout_view.zig").Placement;
+const Divider = @import("layout_view.zig").Divider;
 const mouse = @import("mouse.zig");
 const gio = @import("gio");
 
@@ -47,7 +48,7 @@ const Block = struct {
 };
 
 /// A session window, shown as a tab.
-const Tab = struct {
+pub const Tab = struct {
     window_id: []u8,
     layout: *LayoutWidget,
     page: *adw.TabPage,
@@ -86,7 +87,7 @@ pub const SessionView = struct {
     outstanding: u32 = 0,
     dead: bool = false,
 
-    handlers: [2]c_ulong = .{ 0, 0 },
+    handlers: [3]c_ulong = .{ 0, 0, 0 },
 
     pub fn create(gpa: Allocator, services: *tv.Services, session_id: []const u8, listener: Listener) !*SessionView {
         const self = try gpa.create(SessionView);
@@ -103,6 +104,7 @@ pub const SessionView = struct {
         };
         self.handlers[0] = gobject.Object.signals.notify.connect(tab_view, *SessionView, &onSelectedPage, self, .{ .detail = "selected-page" });
         self.handlers[1] = adw.TabView.signals.close_page.connect(tab_view, *SessionView, &onClosePage, self, .{});
+        self.handlers[2] = adw.TabView.signals.page_reordered.connect(tab_view, *SessionView, &onPageReordered, self, .{});
         return self;
     }
 
@@ -194,6 +196,15 @@ pub const SessionView = struct {
             tab.layout.clear();
             self.tab_view.closePage(tab.page);
             self.freeTab(tab);
+        }
+
+        // Keep our list in the server's order too.
+        for (windows, 0..) |w, index| {
+            if (index >= self.tabs.items.len) break;
+            for (self.tabs.items[index..], index..) |t, j| if (std.mem.eql(u8, t.window_id, w.window_id)) {
+                std.mem.swap(*Tab, &self.tabs.items[index], &self.tabs.items[j]);
+                break;
+            };
         }
 
         if (view.active_window_id) |id| if (self.findTab(id)) |tab| {
@@ -302,6 +313,11 @@ pub const SessionView = struct {
         pane.connect(res.ticket) catch |err| log.err("opening {s} failed: {}", .{ req.block_id, err });
     }
 
+    /// The tab at a position in the server's window order.
+    pub fn tabAt(self: *SessionView, index: usize) ?*Tab {
+        return if (index < self.tabs.items.len) self.tabs.items[index] else null;
+    }
+
     fn findTab(self: *SessionView, window_id: []const u8) ?*Tab {
         for (self.tabs.items) |t| if (std.mem.eql(u8, t.window_id, window_id)) return t;
         return null;
@@ -324,6 +340,7 @@ pub const SessionView = struct {
             .layout = layout,
             .page = self.tab_view.append(layout.as(gtk.Widget)),
         };
+        layout.setResizeHandler(self, onDividerDragged);
         self.tabs.append(gpa, tab) catch {
             self.tab_view.closePage(tab.page);
             self.freeTab(tab);
@@ -347,6 +364,8 @@ pub const SessionView = struct {
 
         var placements: std.ArrayList(Placement) = .empty;
         defer placements.deinit(gpa);
+        var dividers: std.ArrayList(Divider) = .empty;
+        defer dividers.deinit(gpa);
         tab.visible.clearRetainingCapacity();
 
         if (w.zoomed_block_id) |z| {
@@ -358,13 +377,17 @@ pub const SessionView = struct {
             if (layer.state) |s| if (std.mem.eql(u8, s, "minimized")) continue;
             const kind: @import("layout_view.zig").Kind =
                 if (std.mem.eql(u8, layer.kind, "tiled")) .tiled else .floating;
-            if (layer.layout) |root| self.addLeaves(tab, &placements, &root, kind);
+            if (layer.layout) |root| {
+                self.addLeaves(tab, &placements, &root, kind);
+                if (kind == .tiled) addDividers(gpa, &dividers, &root);
+            }
         }
 
         if (placements.items.len > 1) for (placements.items, tab.visible.items) |*p, b| {
             p.dim = if (tab.focused_block_id) |f| !std.mem.eql(u8, f, b.block_id) else false;
         };
         tab.layout.setPlacements(placements.items, self.services.dark);
+        tab.layout.setDividers(dividers.items);
         if (w.label) |l| if (tab.label == null or !std.mem.eql(u8, tab.label.?, l)) {
             if (tab.label) |old| gpa.free(old);
             tab.label = gpa.dupe(u8, l) catch null;
@@ -388,6 +411,38 @@ pub const SessionView = struct {
 
     /// A tab shows its window's label, unless that's the default
     /// ("Window 1a2b3c4d"); then the focused terminal's title.
+    fn addDividers(gpa: Allocator, out: *std.ArrayList(Divider), node: *const api.LayoutNode) void {
+        const s = node.split orelse return;
+        const before = firstBlock(s.before) orelse return;
+        const after = firstBlock(s.after) orelse return;
+        out.append(gpa, .{
+            .rect = node.rect,
+            .vertical = std.mem.eql(u8, s.direction, "vertical"),
+            .ratio = s.ratio,
+            .before = before,
+            .after = after,
+        }) catch return;
+        addDividers(gpa, out, s.before);
+        addDividers(gpa, out, s.after);
+    }
+
+    fn firstBlock(node: *const api.LayoutNode) ?[]const u8 {
+        if (node.block_id) |id| return id;
+        const s = node.split orelse return null;
+        return firstBlock(s.before) orelse firstBlock(s.after);
+    }
+
+    fn onDividerDragged(ctx: *anyopaque, d: Divider, ratio: f64) void {
+        const self: *SessionView = @ptrCast(@alignCast(ctx));
+        self.services.client.send("session.resize_pane", .{
+            .session_id = self.session_id,
+            .direction = if (d.vertical) "vertical" else "horizontal",
+            .before_block_id = d.before,
+            .after_block_id = d.after,
+            .ratio = ratio,
+        });
+    }
+
     fn updateTabTitle(self: *SessionView, tab: *Tab) void {
         var buf: [256]u8 = undefined;
         const label = tab.label orelse "";
@@ -418,12 +473,12 @@ pub const SessionView = struct {
     // ------------------------------------------------------------------
     // Focus and ownership
 
-    fn selectedTab(self: *SessionView) ?*Tab {
+    pub fn selectedTab(self: *SessionView) ?*Tab {
         const page = self.tab_view.getSelectedPage() orelse return null;
         return self.tabForPage(page);
     }
 
-    fn focusedPane(self: *SessionView, tab: *Tab) ?*Pane {
+    pub fn focusedPane(self: *SessionView, tab: *Tab) ?*Pane {
         const id = tab.focused_block_id orelse return null;
         const b = self.blocks.get(id) orelse return null;
         return b.pane;
@@ -495,6 +550,11 @@ pub const SessionView = struct {
         };
     }
 
+    /// The font changed: every pane rebuilds its renderer.
+    pub fn fontsChanged(self: *SessionView) void {
+        for (self.blocks.values()) |b| if (b.pane) |p| p.fontsChanged();
+    }
+
     /// The desktop's light/dark style changed.
     pub fn themeChanged(self: *SessionView) void {
         for (self.blocks.values()) |b| if (b.pane) |p| p.pushTheme();
@@ -515,6 +575,18 @@ pub const SessionView = struct {
         if (self.focusedPane(tab)) |p| _ = p.widgetPtr().grabFocus();
         self.claimVisible();
         self.listener.changed(self.listener.ctx);
+    }
+
+    /// The user dragged a tab to a new place: move the window to match.
+    fn onPageReordered(view: *adw.TabView, page: *adw.TabPage, position: c_int, self: *SessionView) callconv(.c) void {
+        if (self.syncing) return;
+        const tab = self.tabForPage(page) orelse return;
+        const next: ?*Tab = if (position + 1 < view.getNPages()) self.tabForPage(view.getNthPage(position + 1)) else null;
+        if (next) |n| {
+            self.services.client.send("session.move_window", .{ .session_id = self.session_id, .window_id = tab.window_id, .before_window_id = n.window_id });
+        } else {
+            self.services.client.send("session.move_window", .{ .session_id = self.session_id, .window_id = tab.window_id });
+        }
     }
 
     fn onClosePage(view: *adw.TabView, page: *adw.TabPage, self: *SessionView) callconv(.c) c_int {
@@ -568,6 +640,9 @@ pub const SessionView = struct {
             const tab = self.tabShowing(b) orelse return;
             if (self.selectedTab() != tab) tab.page.setNeedsAttention(1);
             if (b.pane) |pane| pane.widgetPtr().errorBell();
+        } else if (std.mem.eql(u8, name, "pwd_changed")) {
+            const p = api.parseValue(struct { pwd: []const u8 = "" }, msg, payload) orelse return;
+            if (b.pane) |pane| pane.setPwd(p.pwd);
         } else if (std.mem.eql(u8, name, "url_clicked")) {
             const p = api.parseValue(struct { url: []const u8 }, msg, payload) orelse return;
             if (b.pane) |pane| mouse.openUrl(pane, p.url);

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const gdk = @import("gdk");
+const glib = @import("glib");
 const gobject = @import("gobject");
 const graphene = @import("graphene");
 const gsk = @import("gsk");
@@ -30,6 +31,25 @@ pub const Placement = struct {
     px: Px = .{},
 };
 
+/// The border between the two sides of a split, which the user can drag.
+pub const Divider = struct {
+    /// The split's [x, y, w, h], as fractions of the window.
+    rect: [4]f64,
+    /// True for a split with one side above the other.
+    vertical: bool,
+    ratio: f64,
+    /// A block on each side, to name the split in `session.resize_pane`.
+    before: []const u8,
+    after: []const u8,
+};
+
+pub const ResizeFn = *const fn (ctx: *anyopaque, d: Divider, ratio: f64) void;
+
+/// How close to a divider, in logical pixels, a press grabs it.
+const grab_distance = 4;
+/// At most one resize request per this many milliseconds while dragging.
+const resize_interval_ms = 30;
+
 const Px = struct { x: f32 = 0, y: f32 = 0, w: f32 = 0, h: f32 = 0 };
 
 /// Space between tiled blocks, in logical pixels.
@@ -42,6 +62,22 @@ pub const LayoutWidget = extern struct {
     const State = struct {
         placements: std.ArrayList(Placement) = .empty,
         dark: bool = true,
+        dividers: std.ArrayList(Divider) = .empty,
+        on_resize: ?struct { ctx: *anyopaque, func: ResizeFn } = null,
+        /// The divider being dragged, and where the drag started.
+        dragging: ?usize = null,
+        drag_x: f64 = 0,
+        drag_y: f64 = 0,
+        last_sent: i64 = 0,
+
+        fn clearDividers(self: *State) void {
+            for (self.dividers.items) |d| {
+                alloc.free(d.before);
+                alloc.free(d.after);
+            }
+            self.dividers.clearRetainingCapacity();
+            self.dragging = null;
+        }
     };
 
     pub const Parent = gtk.Widget;
@@ -63,7 +99,21 @@ pub const LayoutWidget = extern struct {
     fn instanceInit(self: *LayoutWidget, _: *Class) callconv(.c) void {
         self.state = alloc.create(State) catch null;
         if (self.state) |s| s.* = .{};
-        self.as(gtk.Widget).setOverflow(.hidden);
+        const me = self.as(gtk.Widget);
+        me.setOverflow(.hidden);
+
+        // Dragging dividers. Both controllers look at events before the
+        // terminals do, and let go of any that aren't near a divider.
+        const drag = gtk.GestureDrag.new();
+        drag.as(gtk.EventController).setPropagationPhase(.capture);
+        _ = gtk.GestureDrag.signals.drag_begin.connect(drag, *LayoutWidget, &onDragBegin, self, .{});
+        _ = gtk.GestureDrag.signals.drag_update.connect(drag, *LayoutWidget, &onDragUpdate, self, .{});
+        _ = gtk.GestureDrag.signals.drag_end.connect(drag, *LayoutWidget, &onDragEnd, self, .{});
+        me.addController(drag.as(gtk.EventController));
+        const motion = gtk.EventControllerMotion.new();
+        motion.as(gtk.EventController).setPropagationPhase(.capture);
+        _ = gtk.EventControllerMotion.signals.motion.connect(motion, *LayoutWidget, &onMotion, self, .{});
+        me.addController(motion.as(gtk.EventController));
     }
 
     /// Show these blocks, in drawing order (back to front). Widgets that are
@@ -98,9 +148,112 @@ pub const LayoutWidget = extern struct {
         me.queueDraw();
     }
 
-    /// Remove every child.
+    /// Remove every child, the dividers and the resize callback.
     pub fn clear(self: *LayoutWidget) void {
         self.setPlacements(&.{}, true);
+        if (self.state) |s| {
+            s.clearDividers();
+            s.on_resize = null;
+        }
+    }
+
+    pub fn setResizeHandler(self: *LayoutWidget, ctx: *anyopaque, func: ResizeFn) void {
+        if (self.state) |s| s.on_resize = .{ .ctx = ctx, .func = func };
+    }
+
+    /// Replace the draggable dividers. Copies the block IDs.
+    pub fn setDividers(self: *LayoutWidget, dividers: []const Divider) void {
+        const state = self.state orelse return;
+        const dragging = state.dragging;
+        state.clearDividers();
+        for (dividers) |d| {
+            const before = alloc.dupe(u8, d.before) catch continue;
+            const after = alloc.dupe(u8, d.after) catch {
+                alloc.free(before);
+                continue;
+            };
+            var copy = d;
+            copy.before = before;
+            copy.after = after;
+            state.dividers.append(alloc, copy) catch {
+                alloc.free(before);
+                alloc.free(after);
+            };
+        }
+        // A view that arrives mid-drag keeps the same dividers in the same order.
+        if (dragging) |i| if (i < state.dividers.items.len) {
+            state.dragging = i;
+        };
+    }
+
+    /// The divider under a point, if any.
+    fn dividerAt(self: *LayoutWidget, x: f64, y: f64) ?usize {
+        const state = self.state orelse return null;
+        const me = self.as(gtk.Widget);
+        const W: f64 = @floatFromInt(me.getWidth());
+        const H: f64 = @floatFromInt(me.getHeight());
+        for (state.dividers.items, 0..) |d, i| {
+            const r = d.rect;
+            if (d.vertical) {
+                const at = (r[1] + r[3] * d.ratio) * H;
+                if (@abs(y - at) <= grab_distance and x >= r[0] * W and x <= (r[0] + r[2]) * W) return i;
+            } else {
+                const at = (r[0] + r[2] * d.ratio) * W;
+                if (@abs(x - at) <= grab_distance and y >= r[1] * H and y <= (r[1] + r[3]) * H) return i;
+            }
+        }
+        return null;
+    }
+
+    fn onMotion(_: *gtk.EventControllerMotion, x: f64, y: f64, self: *LayoutWidget) callconv(.c) void {
+        const state = self.state orelse return;
+        if (state.dragging != null) return;
+        const me = self.as(gtk.Widget);
+        const cursor: ?[*:0]const u8 = if (self.dividerAt(x, y)) |i|
+            (if (state.dividers.items[i].vertical) "row-resize" else "col-resize")
+        else
+            null;
+        me.setCursorFromName(cursor);
+    }
+
+    fn onDragBegin(drag: *gtk.GestureDrag, x: f64, y: f64, self: *LayoutWidget) callconv(.c) void {
+        const state = self.state orelse return;
+        const i = self.dividerAt(x, y) orelse {
+            _ = drag.as(gtk.Gesture).setState(.denied);
+            return;
+        };
+        _ = drag.as(gtk.Gesture).setState(.claimed);
+        state.dragging = i;
+        state.drag_x = x;
+        state.drag_y = y;
+    }
+
+    fn onDragUpdate(_: *gtk.GestureDrag, dx: f64, dy: f64, self: *LayoutWidget) callconv(.c) void {
+        self.dragTo(dx, dy, false);
+    }
+
+    fn onDragEnd(_: *gtk.GestureDrag, dx: f64, dy: f64, self: *LayoutWidget) callconv(.c) void {
+        self.dragTo(dx, dy, true);
+        if (self.state) |s| s.dragging = null;
+    }
+
+    fn dragTo(self: *LayoutWidget, dx: f64, dy: f64, final: bool) void {
+        const state = self.state orelse return;
+        const i = state.dragging orelse return;
+        if (i >= state.dividers.items.len) return;
+        const d = state.dividers.items[i];
+        const me = self.as(gtk.Widget);
+        const W: f64 = @floatFromInt(me.getWidth());
+        const H: f64 = @floatFromInt(me.getHeight());
+        const ratio = if (d.vertical)
+            ((state.drag_y + dy) / H - d.rect[1]) / d.rect[3]
+        else
+            ((state.drag_x + dx) / W - d.rect[0]) / d.rect[2];
+        const clamped = std.math.clamp(ratio, 0.05, 0.95);
+        const now: i64 = @divTrunc(glib.getMonotonicTime(), 1000);
+        if (!final and now - state.last_sent < resize_interval_ms) return;
+        state.last_sent = now;
+        if (state.on_resize) |cb| cb.func(cb.ctx, d, clamped);
     }
 
     fn sizeAllocate(self: *LayoutWidget, width: c_int, height: c_int, _: c_int) callconv(.c) void {
@@ -193,6 +346,8 @@ pub const LayoutWidget = extern struct {
     fn finalize(self: *LayoutWidget) callconv(.c) void {
         if (self.state) |s| {
             s.placements.deinit(alloc);
+            s.clearDividers();
+            s.dividers.deinit(alloc);
             alloc.destroy(s);
             self.state = null;
         }

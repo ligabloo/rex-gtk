@@ -122,6 +122,14 @@ pub fn build(b: *std.Build) void {
     // Unit tests run against the GTK-free core only.
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
+
+    // GTK-free parts of the UI.
+    const keymap_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/ui/keymap.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(keymap_tests).step);
 }
 
 /// The Ghostty source files the font stack and the OpenGL renderer need,
