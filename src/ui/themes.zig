@@ -22,8 +22,10 @@ const gnome_palette = [16][]const u8{
     "#5e5c64", "#ed333b", "#57e389", "#f8e45c", "#51a1ff", "#c061cb", "#4fd2fd", "#f6f5f4",
 };
 
+// Adwaita view colors. Light text uses the opaque result of compositing
+// libadwaita's rgb(0 0 6 / 80%) foreground over the white view.
 pub const all = [_]Theme{
-    .{ .id = "adwaita", .name = "Adwaita", .dark = false, .foreground = "#1e1e1e", .background = "#ffffff", .cursor = "#1e1e1e", .palette = gnome_palette },
+    .{ .id = "adwaita", .name = "Adwaita", .dark = false, .foreground = "#333338", .background = "#ffffff", .cursor = "#333338", .palette = gnome_palette },
     .{ .id = "solarized-light", .name = "Solarized Light", .dark = false, .foreground = "#657b83", .background = "#fdf6e3", .cursor = "#657b83", .palette = .{
         "#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5",
         "#002b36", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1", "#fdf6e3",
@@ -36,7 +38,7 @@ pub const all = [_]Theme{
         "#5c5f77", "#d20f39", "#40a02b", "#df8e1d", "#1e66f5", "#ea76cb", "#179299", "#acb0be",
         "#6c6f85", "#d20f39", "#40a02b", "#df8e1d", "#1e66f5", "#ea76cb", "#179299", "#bcc0cc",
     } },
-    .{ .id = "adwaita-dark", .name = "Adwaita Dark", .dark = true, .foreground = "#ffffff", .background = "#1e1e1e", .cursor = "#ffffff", .palette = gnome_palette },
+    .{ .id = "adwaita-dark", .name = "Adwaita Dark", .dark = true, .foreground = "#ffffff", .background = "#1d1d20", .cursor = "#ffffff", .palette = gnome_palette },
     .{ .id = "tokyo-night", .name = "Tokyo Night", .dark = true, .foreground = "#c0caf5", .background = "#1a1b26", .cursor = "#c0caf5", .palette = .{
         "#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6",
         "#414868", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5",
@@ -98,6 +100,9 @@ fn hexOf(c: Rgb, buf: *[7]u8) []const u8 {
 /// and header bar take the terminal's background, and the sidebar, cards,
 /// dialogs and popovers a shade towards its text color.
 pub fn tintCss(t: *const Theme, out: []u8) []const u8 {
+    // Let libadwaita supply the native surface colors for its own themes.
+    if (std.mem.eql(u8, t.id, default_light) or std.mem.eql(u8, t.id, default_dark)) return "";
+
     const bg = parseRgb(t.background);
     const fg = parseRgb(t.foreground);
     var b: [6][7]u8 = undefined;
@@ -126,6 +131,8 @@ test "tint css" {
     try std.testing.expectEqual(Rgb{ 0x28, 0x28, 0x28 }, parseRgb("#282828"));
     try std.testing.expectEqual(Rgb{ 128, 128, 128 }, mix(.{ 0, 0, 0 }, .{ 255, 255, 255 }, 0.5));
     var buf: [2048]u8 = undefined;
+    try std.testing.expectEqualStrings("", tintCss(forMode("", false), &buf));
+    try std.testing.expectEqualStrings("", tintCss(forMode("", true), &buf));
     const css = tintCss(find("nord").?, &buf);
     try std.testing.expect(std.mem.indexOf(u8, css, "--window-bg-color: #2e3440;") != null);
     try std.testing.expect(std.mem.indexOf(u8, css, "--headerbar-fg-color: #d8dee9;") != null);
