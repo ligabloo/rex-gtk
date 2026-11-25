@@ -178,6 +178,10 @@ pub const App = struct {
         window.as(gtk.Window).setDefaultSize(1100, 720);
         self.window = window;
         _ = gobject.Object.signals.notify.connect(window, *App, &onActiveChanged, self, .{ .detail = "is-active" });
+        const keys = gtk.EventControllerKey.new();
+        keys.as(gtk.EventController).setPropagationPhase(.capture);
+        _ = gtk.EventControllerKey.signals.key_pressed.connect(keys, *App, &onWindowKey, self, .{});
+        window.as(gtk.Widget).addController(keys.as(gtk.EventController));
 
         // Sidebar: every machine's sessions and their tabs.
         self.sidebar.init(self);
@@ -371,6 +375,25 @@ pub const App = struct {
     fn onShortcut(ctx: *anyopaque, pane: *tv.Pane, keyval: u32, keycode: u32, state: gdk.ModifierType, event: *gdk.KeyEvent, repeat: bool) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
         return self.keys.handle(pane, keyval, keycode, state, event, repeat);
+    }
+
+    /// Key presses anywhere in the window, before the focused widget sees
+    /// them. A terminal runs shortcuts itself; elsewhere, such as in the
+    /// sidebar, this does, so Ctrl+, or the palette work wherever focus is.
+    fn onWindowKey(ctrl: *gtk.EventControllerKey, keyval: c_uint, keycode: c_uint, state: gdk.ModifierType, self: *App) callconv(.c) c_int {
+        const window = self.window orelse return 0;
+        const focus = window.as(gtk.Window).getFocus();
+        if (focus) |f| if (gobject.typeCheckInstanceIsA(@ptrCast(f), tv.TerminalWidget.getGObjectType()) != 0) return 0;
+        // In a text field, only keys with Ctrl, Alt or Super can be ours.
+        const typing = if (focus) |f| gobject.typeCheckInstanceIsA(@ptrCast(f), gtk.Text.getGObjectType()) != 0 else false;
+        if (typing and !(state.control_mask or state.alt_mask or state.super_mask)) return 0;
+        // The keymap works on a pane: the shown tab's focused one.
+        const view = self.view orelse return 0;
+        const tab = view.selectedTab() orelse return 0;
+        const pane = view.focusedPane(tab) orelse return 0;
+        const event = ctrl.as(gtk.EventController).getCurrentEvent() orelse return 0;
+        const key_event = gobject.ext.cast(gdk.KeyEvent, event) orelse return 0;
+        return @intFromBool(self.keys.handle(pane, keyval, keycode, state, key_event, false));
     }
 
     /// A key sequence or mode started or ended: show it in the title.
