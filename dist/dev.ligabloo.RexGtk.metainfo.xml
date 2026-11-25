@@ -26,6 +26,12 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.1" date="2026-11-25">
+      <description>
+        <p>End the session when the last tab closes, including when its last shell exits.</p>
+        <p>Show New Tab on hover or keyboard focus in the session header.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-25">
       <description>
         <p>Browse sessions on remote Rex servers over TCP, TLS, and SSH, and pair devices over Tailscale.</p>

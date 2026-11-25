@@ -78,6 +78,7 @@ pub const SessionView = struct {
     revision: u64 = 0,
     newest_revision: u64 = 0,
     view_pending: bool = false,
+    had_windows: bool = false,
 
     /// Set while we change the tab view ourselves, so its signals don't
     /// turn into requests.
@@ -157,6 +158,13 @@ pub const SessionView = struct {
         if (view.label) |l| self.setLabel(l);
 
         const windows = view.windows orelse &.{};
+        // The last window can also disappear when its last pane closes or exits.
+        if (windows.len != 0) {
+            self.had_windows = true;
+        } else if (self.had_windows and view.revision == self.newest_revision) {
+            self.had_windows = false;
+            self.machine.send("session.destroy", .{ .session_id = self.session_id });
+        }
         const me = self.machine.clientId();
 
         // Blocks: keep the ones still in a window, add new ones, drop the rest.
@@ -324,10 +332,6 @@ pub const SessionView = struct {
     }
 
     pub fn closeTab(self: *SessionView, tab: *const Tab) void {
-        if (self.tabs.items.len == 1) {
-            self.machine.send("session.destroy", .{ .session_id = self.session_id });
-            return;
-        }
         self.machine.send("session.close_window", .{
             .session_id = self.session_id,
             .window_id = tab.window_id,

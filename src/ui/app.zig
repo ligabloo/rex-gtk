@@ -280,7 +280,7 @@ pub const App = struct {
         const about = adw.AboutDialog.new();
         about.setApplicationName("rex-gtk");
         about.setApplicationIcon(app_id);
-        about.setVersion("0.2.0");
+        about.setVersion("0.2.1");
         about.setDeveloperName("ligabloo");
         about.setComments("A GNOME client for Rex, the multiplexer for all work.");
         about.setWebsite("https://github.com/ligabloo/rex-gtk");

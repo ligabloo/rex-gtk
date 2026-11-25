@@ -221,7 +221,7 @@ pub const Sidebar = struct {
             .connected => {
                 const b = gtk.Button.newFromIconName("window-new-symbolic");
                 b.as(gtk.Widget).addCssClass("flat");
-                b.as(gtk.Widget).addCssClass("new-session");
+                b.as(gtk.Widget).addCssClass("row-create");
                 b.as(gtk.Widget).setTooltipText("New Session");
                 _ = gtk.Button.signals.clicked.connect(b, *Machine, &onNewSession, m, .{});
                 box.append(b.as(gtk.Widget));
@@ -260,6 +260,7 @@ pub const Sidebar = struct {
         box.append(label.as(gtk.Widget));
         const new_tab = gtk.Button.newFromIconName("tab-new-symbolic");
         new_tab.as(gtk.Widget).addCssClass("flat");
+        new_tab.as(gtk.Widget).addCssClass("row-create");
         new_tab.as(gtk.Widget).setTooltipText("New Tab");
         _ = gtk.Button.signals.clicked.connect(new_tab, *Sidebar, &onNewTab, self, .{});
         box.append(new_tab.as(gtk.Widget));
