@@ -1,5 +1,5 @@
 //! Preferences › Appearance: where the tabs go, and how the header bar
-//! behaves while the sidebar is collapsed.
+//! behaves.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -64,7 +64,7 @@ pub const AppearancePage = struct {
 
         const behavior = adw.ComboRow.new();
         behavior.as(adw.PreferencesRow).setTitle("Header bar");
-        behavior.as(adw.ActionRow).setSubtitle("While the sidebar is hidden. Show on hover slides it in when the pointer reaches the top edge.");
+        behavior.as(adw.ActionRow).setSubtitle("Show on hover slides it in when the pointer reaches the top edge.");
         const labels = [_:null]?[*:0]const u8{ "Hidden", "Show on hover", "Always show", null };
         const model = gtk.StringList.new(@ptrCast(&labels));
         behavior.setModel(model.as(gio.ListModel));

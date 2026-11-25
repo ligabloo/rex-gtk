@@ -1,16 +1,15 @@
 //! The content's header bar, in the two layouts:
 //!
 //! - Tabs in the sidebar (the default): the sidebar toggle, the tab's name
-//!   over "session · machine", New Tab. While the sidebar is collapsed the
-//!   bar can hide, and slides in over the terminal when the pointer
-//!   reaches the top edge, like Black Box.
+//!   over "session · machine", New Tab. The bar can hide, and slides in
+//!   over the terminal when the pointer reaches the top edge, like Black
+//!   Box.
 //! - Tabs in the header bar: a session switcher (session over machine)
 //!   that opens a popover of every machine's sessions, the tabs, New Tab.
 //!   There is no sidebar.
 //!
 //! Settings: "tabs.layout" is "sidebar" or "header"; "header.behavior" is
-//! "hidden", "hover" or "always" and only matters while the sidebar is
-//! collapsed.
+//! "hidden", "hover" or "always".
 
 const std = @import("std");
 const adw = @import("adw");
@@ -57,6 +56,8 @@ pub const Header = struct {
         const toggle = gtk.ToggleButton.new();
         toggle.as(gtk.Button).setIconName("sidebar-show-symbolic");
         toggle.as(gtk.Widget).setTooltipText("Sessions");
+        toggle.as(gtk.Widget).addCssClass("flat");
+        toggle.as(gtk.Widget).addCssClass("sidebar-toggle");
         bar.packStart(toggle.as(gtk.Widget));
 
         // The session switcher: session name over machine name.
@@ -100,7 +101,7 @@ pub const Header = struct {
         // The palette, beside New Tab while the sidebar (which has its own)
         // is hidden.
         const end_box = gtk.Box.new(.horizontal, 6);
-        const palette = gtk.Button.newFromIconName("system-search-symbolic");
+        const palette = gtk.Button.newFromIconName("modifier-key-symbolic");
         palette.as(gtk.Widget).setTooltipText("Command Palette");
         palette.as(gtk.Actionable).setActionName("app.rex");
         palette.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.palette.toggle"));
@@ -119,6 +120,7 @@ pub const Header = struct {
         tab_bar.as(gtk.Widget).setHexpand(1);
 
         const content = adw.ToolbarView.new();
+        content.setTopBarStyle(.raised);
         content.addTopBar(bar.as(gtk.Widget));
 
         const split = adw.OverlaySplitView.new();
@@ -190,7 +192,7 @@ pub const Header = struct {
 
     /// Whether the bar hides while not hovered.
     fn autoHides(self: *const Header) bool {
-        return self.layout == .sidebar and self.split.getShowSidebar() == 0 and self.behavior != .always;
+        return self.layout == .sidebar and self.behavior != .always;
     }
 
     fn updateReveal(self: *Header) void {
