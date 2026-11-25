@@ -70,6 +70,15 @@ pub const App = struct {
     /// The session we show.
     view: ?*SessionView = null,
 
+    /// Reconnecting after the control connection dropped: the session to
+    /// show again, the token that continues our client, and the attempt.
+    reattach_id: ?[]u8 = null,
+    reconnect_token: ?[]u8 = null,
+    reconnect_attempt: u32 = 0,
+    reconnect_id: c_uint = 0,
+    /// The client whose connection dropped, freed once we reconnect.
+    dead_client: ?*Client = null,
+
     pub fn create(gpa: Allocator, io: std.Io, socket_path: []const u8, options: Options) !*App {
         const self = try gpa.create(App);
         self.* = .{
@@ -87,8 +96,42 @@ pub const App = struct {
         return self;
     }
 
+    extern fn g_unix_signal_add(signum: c_int, handler: *const fn (?*anyopaque) callconv(.c) c_int, data: ?*anyopaque) c_uint;
+
+    /// SIGTERM or SIGINT: quit cleanly, so the server drops our client at
+    /// once instead of keeping it for a reconnect.
+    fn onQuitSignal(data: ?*anyopaque) callconv(.c) c_int {
+        const self: *App = @ptrCast(@alignCast(data.?));
+        self.adw_app.as(gio.Application).quit();
+        return 0;
+    }
+
+    /// Debug builds: SIGUSR1 drops the control connection and SIGUSR2 every
+    /// data stream, without a close frame, to test reconnecting.
+    fn onDropSignal(data: ?*anyopaque) callconv(.c) c_int {
+        const self: *App = @ptrCast(@alignCast(data.?));
+        if (self.services) |s| s.client.ctl.conn.shutdown();
+        return 1;
+    }
+
+    fn onDropStreamsSignal(data: ?*anyopaque) callconv(.c) c_int {
+        const self: *App = @ptrCast(@alignCast(data.?));
+        if (self.view) |v| v.dropStreams();
+        return 1;
+    }
+
     pub fn run(self: *App) u8 {
+        if (@import("builtin").mode == .debug) {
+            _ = g_unix_signal_add(@intCast(@intFromEnum(std.posix.SIG.USR1)), &onDropSignal, self);
+            _ = g_unix_signal_add(@intCast(@intFromEnum(std.posix.SIG.USR2)), &onDropStreamsSignal, self);
+        }
+        _ = g_unix_signal_add(@intCast(@intFromEnum(std.posix.SIG.TERM)), &onQuitSignal, self);
+        _ = g_unix_signal_add(@intCast(@intFromEnum(std.posix.SIG.INT)), &onQuitSignal, self);
         const status = gio.Application.run(self.adw_app.as(gio.Application), 0, null);
+        // Run what shutdown queued, such as freeing streams after their
+        // threads end.
+        const ctx = glib.MainContext.default();
+        while (ctx.iteration(0) != 0) {}
         return @intCast(status);
     }
 
@@ -265,6 +308,11 @@ pub const App = struct {
     fn onShutdown(_: *adw.Application, self: *App) callconv(.c) void {
         if (self.view) |v| v.destroy();
         self.view = null;
+        if (self.reconnect_id != 0) _ = glib.Source.remove(self.reconnect_id);
+        if (self.dead_client) |c| c.destroy();
+        self.dead_client = null;
+        if (self.reattach_id) |id| self.gpa.free(id);
+        if (self.reconnect_token) |t| self.gpa.free(t);
         if (self.services) |*s| {
             s.client.destroy();
             s.fonts.destroy();
@@ -336,17 +384,7 @@ pub const App = struct {
         });
         errdefer fonts.destroy();
 
-        const client = try Client.connect(self.gpa, self.io, self.socket_path, .{
-            .kind = "app",
-            .platform = "linux",
-            .name = "rex-gtk",
-            .version = "0.0.1",
-            .label = self.options.label,
-        }, .{
-            .ctx = self,
-            .event = onEvent,
-            .disconnected = onDisconnected,
-        });
+        const client = try self.connectClient();
         self.services = .{
             .gpa = self.gpa,
             .io = self.io,
@@ -373,6 +411,20 @@ pub const App = struct {
         client.call("session.list", null, self, &onFirstSessionList);
     }
 
+    fn connectClient(self: *App) !*Client {
+        return Client.connect(self.gpa, self.io, self.socket_path, .{
+            .kind = "app",
+            .platform = "linux",
+            .name = "rex-gtk",
+            .version = "0.0.1",
+            .label = self.options.label,
+        }, self.reconnect_token, .{
+            .ctx = self,
+            .event = onEvent,
+            .disconnected = onDisconnected,
+        });
+    }
+
     fn onDarkChanged(sm: *adw.StyleManager, _: *gobject.ParamSpec, self: *App) callconv(.c) void {
         const services = if (self.services) |*s| s else return;
         services.dark = sm.getDark() != 0;
@@ -397,13 +449,16 @@ pub const App = struct {
         self.setSessions(list);
 
         var attach: ?[]const u8 = null;
-        if (self.options.session) |want| {
+        if (self.reattach_id) |id| for (list.sessions) |s| {
+            if (std.mem.eql(u8, s.session_id, id)) attach = s.session_id;
+        };
+        if (attach == null) if (self.options.session) |want| {
             for (list.sessions) |s| {
                 if (std.mem.eql(u8, s.session_id, want) or std.mem.eql(u8, s.label, want) or
                     std.mem.endsWith(u8, s.session_id, want)) attach = s.session_id;
             }
             if (attach == null) log.warn("no session matches {s}; letting the server pick", .{want});
-        }
+        };
 
         const tickets = &[_]api.TicketRequest{.{}};
         if (attach) |id| {
@@ -598,7 +653,16 @@ pub const App = struct {
         defer msg.deinit();
         const ev = msg.kind.event;
 
-        if (std.mem.eql(u8, ev.name, "keymap_changed")) {
+        if (std.mem.eql(u8, ev.name, "event_dropped")) {
+            // Fetch again whatever the event would have changed.
+            const p = api.parseValue(struct { event_type: []const u8 = "", session_id: ?[]const u8 = null }, msg, ev.payload) orelse return;
+            log.warn("the server dropped a {s} event", .{p.event_type});
+            if (p.session_id) |sid| {
+                if (self.view) |v| if (std.mem.eql(u8, v.session_id, sid)) v.refreshView();
+            }
+            if (std.mem.eql(u8, p.event_type, "keymap_changed")) self.keys.fetch();
+            self.refreshSessions();
+        } else if (std.mem.eql(u8, ev.name, "keymap_changed")) {
             const p = api.parseValue(struct { hash: []const u8 = "" }, msg, ev.payload) orelse return;
             self.keys.changed(p.hash);
         } else if (std.mem.eql(u8, ev.name, "client_perform_requested")) {
@@ -649,9 +713,70 @@ pub const App = struct {
 
     fn onDisconnected(ctx: ?*anyopaque) void {
         const self: *App = @ptrCast(@alignCast(ctx.?));
-        log.warn("lost the connection to the Rex server", .{});
-        if (self.view) |v| v.destroy();
-        self.view = null;
-        self.showStatus("network-offline-symbolic", "Disconnected from Rex", "Restart rex-gtk to reconnect.");
+        log.warn("lost the connection to the Rex server; reconnecting", .{});
+        const services = if (self.services) |*s| s else return;
+
+        // Remember where we were and how to continue our client.
+        if (self.view) |v| {
+            if (self.reattach_id) |old| self.gpa.free(old);
+            self.reattach_id = self.gpa.dupe(u8, v.session_id) catch null;
+            v.destroy();
+            self.view = null;
+        }
+        if (self.reconnect_token) |t| self.gpa.free(t);
+        self.reconnect_token = self.gpa.dupe(u8, services.client.ctl.reconnectToken()) catch null;
+        self.dead_client = services.client;
+        self.prompts.deinit();
+        self.prompts = .init(self.gpa, self);
+        self.reconnect_attempt = 0;
+        self.showStatus("network-offline-symbolic", "Reconnecting to Rex…", null);
+        self.scheduleReconnect(250);
+    }
+
+    fn scheduleReconnect(self: *App, delay_ms: c_uint) void {
+        if (self.reconnect_id != 0) _ = glib.Source.remove(self.reconnect_id);
+        self.reconnect_id = glib.timeoutAdd(delay_ms, &onReconnect, self);
+    }
+
+    fn onReconnect(data: ?*anyopaque) callconv(.c) c_int {
+        const self: *App = @ptrCast(@alignCast(data.?));
+        self.reconnect_id = 0;
+        self.reconnect_attempt += 1;
+        const services = if (self.services) |*s| s else return 0;
+
+        // The server may have stopped; ask the rex CLI to start it.
+        if (self.reconnect_attempt == 2) startServer();
+
+        const client = self.connectClient() catch |err| {
+            const delay: c_uint = @min(5000, @as(c_uint, 250) << @intCast(@min(self.reconnect_attempt, 5)));
+            var buf: [128]u8 = undefined;
+            const note = std.fmt.bufPrint(&buf, "{s}. Trying again in {d} s.", .{ @errorName(err), (delay + 999) / 1000 }) catch "";
+            self.showStatus("network-offline-symbolic", "Reconnecting to Rex…", note);
+            self.scheduleReconnect(delay);
+            return 0;
+        };
+        log.info("reconnected (resumed: {})", .{client.ctl.resumed});
+        if (self.dead_client) |old| old.destroy();
+        self.dead_client = null;
+        services.client = client;
+        if (self.reconnect_token) |t| self.gpa.free(t);
+        self.reconnect_token = null;
+        self.keys.fetch();
+        self.rex().call("session.list", null, self, &onFirstSessionList);
+        return 0;
+    }
+
+    /// Start the Rex server if it isn't running, the way the rex CLI does.
+    fn startServer() void {
+        const argv = [_:null]?[*:0]const u8{ "rex", "__internal", "autostart-status", null };
+        var err: ?*glib.Error = null;
+        const proc = gio.Subprocess.newv(@ptrCast(&argv), .{ .stdout_silence = true, .stderr_silence = true }, &err) orelse {
+            if (err) |e| {
+                log.warn("starting the Rex server failed: {s}", .{e.f_message orelse "?"});
+                e.free();
+            }
+            return;
+        };
+        proc.as(gobject.Object).unref();
     }
 };

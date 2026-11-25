@@ -244,6 +244,7 @@ pub const SessionView = struct {
             return block;
         };
         pane.on_title = .{ .ctx = self, .func = onPaneTitle };
+        pane.on_stream_lost = .{ .ctx = self, .func = onStreamLost };
         block.pane = pane;
 
         for (tickets) |t| if (std.mem.eql(u8, t.block_id, b.block_id)) {
@@ -555,6 +556,13 @@ pub const SessionView = struct {
         for (self.blocks.values()) |b| if (b.pane) |p| p.fontsChanged();
     }
 
+    /// Debugging: cut every data connection, as a network drop would.
+    pub fn dropStreams(self: *SessionView) void {
+        for (self.blocks.values()) |b| if (b.pane) |p| if (p.stream) |st| {
+            if (st.conn.load(.acquire)) |dc| dc.shutdown();
+        };
+    }
+
     /// The desktop's light/dark style changed.
     pub fn themeChanged(self: *SessionView) void {
         for (self.blocks.values()) |b| if (b.pane) |p| p.pushTheme();
@@ -739,6 +747,12 @@ pub const SessionView = struct {
     fn tabShowing(self: *SessionView, b: *Block) ?*Tab {
         for (self.tabs.items) |tab| for (tab.visible.items) |v| if (v == b) return tab;
         return null;
+    }
+
+    fn onStreamLost(ctx: *anyopaque, pane: *Pane) void {
+        const self: *SessionView = @ptrCast(@alignCast(ctx));
+        if (self.blocks.get(pane.block_id) == null) return;
+        self.requestTicket(pane.block_id);
     }
 
     fn onPaneTitle(ctx: *anyopaque, _: *Pane) void {

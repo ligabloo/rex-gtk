@@ -35,6 +35,16 @@ with the clipboard, and Ctrl+click opens a URL. The wheel scrolls back through t
 history; typing returns to the bottom. When a program asks for the mouse (htop, vim with
 `mouse=a`) events go to it instead; hold Shift to select text anyway.
 
+## Connection problems
+
+If the connection to the server drops, rex-gtk reconnects with backoff, continuing the same client
+when the server still has it, and starts the server with `rex __internal autostart-status` if it
+stopped. A terminal whose stream drops reopens it with a new ticket. A terminal whose snapshot
+can't be decoded says so: the Rex server uses a different Ghostty version (see below).
+
+In debug builds, `kill -USR1` drops the control connection and `kill -USR2` drops every data
+stream, to test reconnecting. `kill -TERM` and Ctrl+C quit cleanly.
+
 ## Shortcuts and remote control
 
 Actions use Rex.app's names, so bindings in `~/.config/rex/init.lua` work here too, and

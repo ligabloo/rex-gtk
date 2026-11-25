@@ -17,6 +17,7 @@ const core = @import("core");
 const render = @import("render");
 const Client = @import("client.zig").Client;
 const Stream = @import("stream.zig").Stream;
+const StreamEnd = @import("stream.zig").End;
 const input = @import("input.zig");
 const mouse = @import("mouse.zig");
 
@@ -110,6 +111,14 @@ pub const Pane = struct {
     /// Mouse, selection and scrolling state; see mouse.zig.
     pointer: mouse.State = .{},
 
+    /// Why the terminal can't be shown, drawn over it.
+    failure: ?[:0]const u8 = null,
+    /// Reconnecting a lost stream: attempts so far and the pending timer.
+    stream_retries: u8 = 0,
+    retry_id: c_uint = 0,
+    /// Asked to get a new ticket and call `connect` again.
+    on_stream_lost: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, pane: *Pane) void } = null,
+
     /// Called when the program in the block has exited.
     on_exit: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, pane: *Pane) void } = null,
 
@@ -156,6 +165,7 @@ pub const Pane = struct {
         const gpa = self.services.gpa;
         if (self.tick_id != 0) self.widget.as(gtk.Widget).removeTickCallback(self.tick_id);
         if (self.blink_id != 0) _ = glib.Source.remove(self.blink_id);
+        if (self.retry_id != 0) _ = glib.Source.remove(self.retry_id);
         if (self.stream) |s| s.destroy();
         self.pointer.deinit(if (self.mirror) |m| &m.terminal else null);
         if (self.mirror) |m| m.destroy();
@@ -282,11 +292,22 @@ pub const Pane = struct {
             decoded.deinit(gpa);
             gpa.destroy(decoded);
         }
-        self.mirror = Mirror.create(gpa, decoded, nonce) catch |err| {
+        const mirror = Mirror.create(gpa, decoded, nonce) catch |err| {
             log.err("building terminal from snapshot failed: {}", .{err});
             return;
         };
+        // A reconnected stream starts over with a new snapshot.
+        if (self.mirror) |old| {
+            self.pointer.deinit(&old.terminal);
+            self.pointer = .{};
+            old.destroy();
+        }
+        self.mirror = mirror;
+        self.stream_retries = 0;
+        self.failure = null;
+        self.renderer.invalidate();
         self.markDirty();
+        self.widget.as(gtk.Widget).queueDraw();
     }
 
     fn onStreamBytes(ctx: *anyopaque, bytes: []const u8) void {
@@ -301,9 +322,40 @@ pub const Pane = struct {
         }
     }
 
-    fn onStreamEnded(ctx: *anyopaque, close_code: ?u16) void {
+    fn onStreamEnded(ctx: *anyopaque, end: StreamEnd) void {
         const self: *Pane = @ptrCast(@alignCast(ctx));
-        log.info("stream for {s} ended (status {?})", .{ self.block_id, close_code });
+        log.info("stream for {s} ended (status {?})", .{ self.block_id, end.close_code });
+        if (self.stream) |s| s.destroy();
+        self.stream = null;
+
+        if (end.snapshot_failed) {
+            return self.fail("Can't read this terminal: the Rex server uses a different Ghostty version. Update rex-gtk's Ghostty pin (see README).");
+        }
+        const code = end.close_code orelse 0;
+        // The block closed, or the stream ended normally: nothing to resume.
+        if (code == 4000 or code == 1000) return;
+        // 1008 without a handshake problem: the block can't stream at all.
+        if (code == 1008 and !end.open_failed) return self.fail("This block has no terminal stream.");
+
+        // Dropped, canceled, or "reconnect required": start over with a
+        // new ticket, backing off.
+        if (self.stream_retries >= 8) return self.fail("Lost this terminal's stream.");
+        const delay: c_uint = @min(5000, @as(c_uint, 200) << @intCast(self.stream_retries));
+        self.stream_retries += 1;
+        if (self.retry_id != 0) _ = glib.Source.remove(self.retry_id);
+        self.retry_id = glib.timeoutAdd(delay, &onRetry, self);
+    }
+
+    fn onRetry(data: ?*anyopaque) callconv(.c) c_int {
+        const self: *Pane = @ptrCast(@alignCast(data.?));
+        self.retry_id = 0;
+        if (self.on_stream_lost) |cb| cb.func(cb.ctx, self);
+        return 0;
+    }
+
+    fn fail(self: *Pane, message: [:0]const u8) void {
+        self.failure = message;
+        self.widget.as(gtk.Widget).queueDraw();
     }
 
     // ------------------------------------------------------------------
@@ -779,7 +831,19 @@ pub const TerminalWidget = extern struct {
     /// program has exited.
     fn snapshotOverlay(self: *TerminalWidget, snap: *gtk.Snapshot) void {
         const pane = self.pane orelse return;
+        const widget = self.as(gtk.Widget);
+        if (pane.failure) |message| return self.drawNote(snap, message, pane.mirror == null);
         const code = pane.exitCode() orelse return;
+        var buf: [96]u8 = undefined;
+        const text = std.fmt.bufPrintSentinel(&buf, "Process exited with status {d}", .{code}, 0) catch return;
+        _ = widget;
+        self.drawNote(snap, text, false);
+    }
+
+    /// Shade the terminal and write a line of text over it, centred, or
+    /// near the bottom if the terminal is still worth seeing.
+    fn drawNote(self: *TerminalWidget, snap: *gtk.Snapshot, text: [:0]const u8, center: bool) void {
+        const pane = self.pane orelse return;
         const widget = self.as(gtk.Widget);
         const W: f32 = @floatFromInt(widget.getWidth());
         const H: f32 = @floatFromInt(widget.getHeight());
@@ -792,9 +856,10 @@ pub const TerminalWidget = extern struct {
             .{ .f_red = 1, .f_green = 1, .f_blue = 1, .f_alpha = 0.55 };
         snap.appendColor(&shade, &rect);
 
-        var buf: [96]u8 = undefined;
-        const text = std.fmt.bufPrintSentinel(&buf, "Process exited with status {d}", .{code}, 0) catch return;
         const layout = widget.createPangoLayout(text);
+        layout.setWidth(@intFromFloat(@max(1, W - 32) * 1024));
+        layout.setWrap(.word_char);
+        layout.setAlignment(.center);
         defer layout.as(gobject.Object).unref();
         var lw: c_int = 0;
         var lh: c_int = 0;
@@ -803,7 +868,8 @@ pub const TerminalWidget = extern struct {
         widget.getColor(&fg);
         snap.save();
         defer snap.restore();
-        snap.translate(&.{ .f_x = (W - @as(f32, @floatFromInt(lw))) / 2, .f_y = H - @as(f32, @floatFromInt(lh)) - 16 });
+        const y: f32 = if (center) (H - @as(f32, @floatFromInt(lh))) / 2 else H - @as(f32, @floatFromInt(lh)) - 16;
+        snap.translate(&.{ .f_x = 16, .f_y = y });
         snap.appendLayout(layout, &fg);
     }
 
