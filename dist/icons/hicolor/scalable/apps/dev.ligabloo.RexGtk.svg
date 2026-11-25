@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3d3846"/>
+      <stop offset="1" stop-color="#241f31"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5e5c64"/>
+      <stop offset="1" stop-color="#1a1625"/>
+    </linearGradient>
+  </defs>
+  <!-- Base, with the GNOME-style bottom lip -->
+  <rect x="8" y="14" width="112" height="104" rx="14" fill="url(#edge)"/>
+  <rect x="8" y="10" width="112" height="100" rx="14" fill="url(#body)"/>
+  <!-- Three panes: the large left one active -->
+  <rect x="16" y="18" width="56" height="84" rx="6" fill="#1e1b26" stroke="#62a0ea" stroke-width="2"/>
+  <rect x="78" y="18" width="34" height="39" rx="6" fill="#1e1b26" opacity="0.85"/>
+  <rect x="78" y="63" width="34" height="39" rx="6" fill="#1e1b26" opacity="0.85"/>
+  <!-- Prompt and cursor -->
+  <path d="M26 36 l10 8 l-10 8" fill="none" stroke="#8ff0a4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="42" y="47" width="16" height="5" rx="2" fill="#f6f5f4"/>
+  <!-- Text lines in the side panes -->
+  <rect x="84" y="28" width="20" height="4" rx="2" fill="#9a9996"/>
+  <rect x="84" y="37" width="14" height="4" rx="2" fill="#9a9996"/>
+  <rect x="84" y="73" width="22" height="4" rx="2" fill="#9a9996"/>
+  <rect x="84" y="82" width="12" height="4" rx="2" fill="#9a9996"/>
+</svg>

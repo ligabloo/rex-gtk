@@ -67,6 +67,15 @@ functions all work. Built-in shortcuts:
 | Ctrl+Shift+S, F11 | Sidebar, full screen |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Font size |
 
+## Install
+
+```sh
+zig build -Doptimize=ReleaseFast -Dtools=false --prefix ~/.local
+```
+
+installs `rex-gtk`, its desktop entry, icon and AppStream metadata. An aerynOS recipe lives in
+the `aerynos-recipes` repo (`recipes/rex-gtk`).
+
 ## Tools
 
 - `rexcat BLOCK [--follow MS] [--record FILE]`: attach to a terminal headlessly and print it;

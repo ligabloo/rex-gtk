@@ -77,6 +77,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // Desktop integration, for `zig build install --prefix ~/.local` and packages.
+    b.installFile("dist/dev.ligabloo.RexGtk.desktop", "share/applications/dev.ligabloo.RexGtk.desktop");
+    b.installFile("dist/dev.ligabloo.RexGtk.metainfo.xml", "share/metainfo/dev.ligabloo.RexGtk.metainfo.xml");
+    b.installFile(
+        "dist/icons/hicolor/scalable/apps/dev.ligabloo.RexGtk.svg",
+        "share/icons/hicolor/scalable/apps/dev.ligabloo.RexGtk.svg",
+    );
+    // rex-gtk includes code derived from Ghostty, under Ghostty's MIT license.
+    b.getInstallStep().dependOn(&b.addInstallFile(ghostty.path("LICENSE"), "share/licenses/rex-gtk/LICENSE.ghostty").step);
+
+    // The headless tools are for development; packages can leave them out.
+    const install_tools = b.option(bool, "tools", "Install rexcat, rexshot and fontcheck (default: true)") orelse true;
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
@@ -92,7 +105,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "core", .module = core_mod }},
         }),
     });
-    b.installArtifact(rexcat);
+    if (install_tools) b.installArtifact(rexcat);
 
     const fontcheck = b.addExecutable(.{
         .name = "fontcheck",
@@ -103,7 +116,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "render", .module = render_mod }},
         }),
     });
-    b.installArtifact(fontcheck);
+    if (install_tools) b.installArtifact(fontcheck);
 
     const rexshot = b.addExecutable(.{
         .name = "rexshot",
@@ -117,7 +130,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(rexshot);
+    if (install_tools) b.installArtifact(rexshot);
 
     // Unit tests run against the GTK-free core only.
     const core_tests = b.addTest(.{ .root_module = core_mod });

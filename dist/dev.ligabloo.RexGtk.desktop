@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Rex GTK
+GenericName=Terminal Multiplexer
+Comment=Sessions, tabs and splits from your Rex server
+Exec=rex-gtk
+Icon=dev.ligabloo.RexGtk
+Terminal=false
+Categories=System;TerminalEmulator;GTK;
+Keywords=terminal;shell;multiplexer;tmux;
+StartupNotify=true
+StartupWMClass=dev.ligabloo.RexGtk
+Actions=new-session;
+
+[Desktop Action new-session]
+Name=New Window
+Exec=rex-gtk
