@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Declare every option before the first `orelse return`: on its first
+    // pass, while lazy dependencies are still missing, the build script
+    // returns early, and options it never reached are rejected.
+    // The headless tools are for development; packages can leave them out.
+    const install_tools = b.option(bool, "tools", "Install rexcat, rexshot and fontcheck (default: true)") orelse true;
 
     const run_step = b.step("run", "Run rex-gtk");
     const test_step = b.step("test", "Run unit tests");
@@ -88,8 +93,6 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&b.addInstallFile(ghostty.path("LICENSE"), "share/licenses/rex-gtk/LICENSE.ghostty").step);
     b.installFile("LICENSE", "share/licenses/rex-gtk/LICENSE");
 
-    // The headless tools are for development; packages can leave them out.
-    const install_tools = b.option(bool, "tools", "Install rexcat, rexshot and fontcheck (default: true)") orelse true;
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
