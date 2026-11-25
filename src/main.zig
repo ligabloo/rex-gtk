@@ -32,6 +32,8 @@ pub fn main(init: std.process.Init) !u8 {
                 options.font_size = std.fmt.parseFloat(f32, args.next() orelse return fail(usage)) catch return fail(usage);
             } else if (std.mem.eql(u8, arg, "--dump-frame")) {
                 options.dump_frame = args.next() orelse return fail(usage);
+            } else if (std.mem.eql(u8, arg, "--screenshot")) {
+                options.screenshot = args.next() orelse return fail(usage);
             } else if (std.mem.eql(u8, arg, "--label")) {
                 options.label = args.next() orelse return fail(usage);
             } else return fail(usage);

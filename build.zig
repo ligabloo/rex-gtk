@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
             .{ "glib", "glib2" },
             .{ "gobject", "gobject2" },
             .{ "graphene", "graphene1" },
+            .{ "gsk", "gsk4" },
             .{ "gtk", "gtk4" },
             .{ "pango", "pango1" },
         };

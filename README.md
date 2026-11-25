@@ -22,7 +22,12 @@ zig build test                                 # unit tests (no display needed)
 
 Options: `--session ID|LABEL` picks the session to show (otherwise the server picks one),
 `--font`/`--font-size` set the terminal font, `--label` names this client for
-`rex -C LABEL …`, and `--dump-frame PATH` writes every frame to a PNG for debugging.
+`rex -C LABEL …`. For debugging, `--dump-frame PATH` writes every terminal frame to a PNG and
+`--screenshot PATH` saves the whole window to a PNG every second.
+
+The window shows the server's sessions in a sidebar (toggle it with the button at the top left)
+and the selected session's windows as tabs. Splits, zoom and floating layers follow the server's
+view, so changes made with the `rex` CLI or another app show up live.
 
 ## Tools
 

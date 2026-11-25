@@ -72,6 +72,15 @@ pub const Pane = struct {
     requested_cols: u16 = 0,
     requested_rows: u16 = 0,
 
+    /// We own the block, so its size and theme follow this widget.
+    owned: bool = false,
+    /// The server says this is the focused block of its window.
+    server_focused: bool = false,
+    /// The title the program set, if any.
+    title: ?[]u8 = null,
+    /// Called when the title changes.
+    on_title: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, pane: *Pane) void } = null,
+
     dirty: bool = false,
     tick_id: c_uint = 0,
     blink_id: c_uint = 0,
@@ -83,11 +92,15 @@ pub const Pane = struct {
     im_commit: std.ArrayList(u8) = .empty,
     composing: bool = false,
     pressed: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Our event controllers on the widget, removed in `destroy`: GTK may
+    /// keep the widget alive (and send it events) after the pane is gone.
+    controllers: std.ArrayList(*gtk.EventController) = .empty,
 
     /// Called when the program in the block has exited.
     on_exit: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, pane: *Pane) void } = null,
 
-    pub fn create(services: *Services, session_id: []const u8, block_id: []const u8, ticket: []const u8) !*Pane {
+    /// Create the pane and its widget. Nothing shows until `connect`.
+    pub fn create(services: *Services, session_id: []const u8, block_id: []const u8) !*Pane {
         const gpa = services.gpa;
         const self = try gpa.create(Pane);
         errdefer gpa.destroy(self);
@@ -101,15 +114,28 @@ pub const Pane = struct {
             .renderer = try .init(gpa, services.gpu, services.fonts, .{}),
         };
         self.widget.pane = self;
+        // The pane holds its own reference: the widget moves between
+        // containers as the block moves between windows.
+        _ = self.widget.as(gobject.Object).refSink();
         self.setupInput();
+        return self;
+    }
 
-        self.stream = try Stream.create(gpa, services.io, services.socket_path, ticket, .{
+    /// Open the block's data stream with a ticket from `data.connect` or
+    /// `session.bootstrap`.
+    pub fn connect(self: *Pane, ticket: []const u8) !void {
+        if (self.stream) |s| s.destroy();
+        self.stream = null;
+        self.stream = try Stream.create(self.services.gpa, self.services.io, self.services.socket_path, ticket, .{
             .ctx = self,
             .ready = onStreamReady,
             .bytes = onStreamBytes,
             .ended = onStreamEnded,
         });
-        return self;
+    }
+
+    pub fn widgetPtr(self: *Pane) *gtk.Widget {
+        return self.widget.as(gtk.Widget);
     }
 
     pub fn destroy(self: *Pane) void {
@@ -125,13 +151,42 @@ pub const Pane = struct {
 
         self.widget.pane = null;
         self.widget.setTexture(null);
+        const w = self.widget.as(gtk.Widget);
+        for (self.controllers.items) |c| w.removeController(c);
+        self.controllers.deinit(gpa);
+        _ = gobject.signalHandlersDisconnectMatched(self.im.as(gobject.Object), .{ .data = true }, 0, 0, null, null, self);
         self.im.as(gtk.IMContext).setClientWidget(null);
         self.im.as(gobject.Object).unref();
+        if (w.getParent() != null) w.unparent();
+        self.widget.as(gobject.Object).unref();
         self.im_commit.deinit(gpa);
         self.pressed.deinit(gpa);
+        if (self.title) |t| gpa.free(t);
         gpa.free(self.session_id);
         gpa.free(self.block_id);
         gpa.destroy(self);
+    }
+
+    /// Whether we own the block. Taking it over sizes the terminal to this
+    /// widget and gives it our theme.
+    pub fn setOwned(self: *Pane, owned: bool) void {
+        if (owned == self.owned) return;
+        self.owned = owned;
+        if (!owned) return;
+        self.requested_cols = 0;
+        self.requested_rows = 0;
+        self.requestGridSize();
+        self.pushTheme();
+    }
+
+    pub fn setTitle(self: *Pane, title: []const u8) void {
+        const gpa = self.services.gpa;
+        if (self.title) |t| {
+            if (std.mem.eql(u8, t, title)) return;
+            gpa.free(t);
+        }
+        self.title = gpa.dupe(u8, title) catch null;
+        if (self.on_title) |cb| cb.func(cb.ctx, self);
     }
 
     pub fn exitCode(self: *const Pane) ?i64 {
@@ -182,7 +237,7 @@ pub const Pane = struct {
     }
 
     fn requestGridSize(self: *Pane) void {
-        if (self.device_w == 0) return;
+        if (self.device_w == 0 or !self.owned) return;
         const grid = self.renderer.gridForSize(self.device_w, self.device_h);
         if (grid.cols == self.requested_cols and grid.rows == self.requested_rows) return;
         self.requested_cols = grid.cols;
@@ -212,6 +267,8 @@ pub const Pane = struct {
     fn onTick(_: *gtk.Widget, _: *gdk.FrameClock, data: ?*anyopaque) callconv(.c) c_int {
         const self: *Pane = @ptrCast(@alignCast(data.?));
         self.tick_id = 0;
+        // Hidden panes draw when they're shown again (see `TerminalWidget.map`).
+        if (self.widget.as(gtk.Widget).getMapped() == 0) return 0;
         if (self.dirty) {
             self.dirty = false;
             self.renderFrame();
@@ -351,16 +408,16 @@ pub const Pane = struct {
         const keys = gtk.EventControllerKey.new();
         _ = gtk.EventControllerKey.signals.key_pressed.connect(keys, *Pane, &onKeyPressed, self, .{});
         _ = gtk.EventControllerKey.signals.key_released.connect(keys, *Pane, &onKeyReleased, self, .{});
-        widget.addController(keys.as(gtk.EventController));
+        self.addController(keys.as(gtk.EventController));
 
         const focus = gtk.EventControllerFocus.new();
         _ = gtk.EventControllerFocus.signals.enter.connect(focus, *Pane, &onFocusEnter, self, .{});
         _ = gtk.EventControllerFocus.signals.leave.connect(focus, *Pane, &onFocusLeave, self, .{});
-        widget.addController(focus.as(gtk.EventController));
+        self.addController(focus.as(gtk.EventController));
 
         const click = gtk.GestureClick.new();
         _ = gtk.GestureClick.signals.pressed.connect(click, *Pane, &onClick, self, .{});
-        widget.addController(click.as(gtk.EventController));
+        self.addController(click.as(gtk.EventController));
 
         const im = self.im.as(gtk.IMContext);
         im.setClientWidget(widget);
@@ -369,8 +426,17 @@ pub const Pane = struct {
         _ = gtk.IMContext.signals.preedit_end.connect(im, *Pane, &onPreeditEnd, self, .{});
     }
 
+    fn addController(self: *Pane, c: *gtk.EventController) void {
+        self.widget.as(gtk.Widget).addController(c);
+        self.controllers.append(self.services.gpa, c) catch {};
+    }
+
     fn onClick(_: *gtk.GestureClick, _: c_int, _: f64, _: f64, self: *Pane) callconv(.c) void {
         _ = self.widget.as(gtk.Widget).grabFocus();
+        if (!self.server_focused) self.services.client.send("session.focus_block", .{
+            .session_id = self.session_id,
+            .block_id = self.block_id,
+        });
     }
 
     fn onKeyPressed(ctrl: *gtk.EventControllerKey, keyval: c_uint, keycode: c_uint, state: gdk.ModifierType, self: *Pane) callconv(.c) c_int {
@@ -474,23 +540,13 @@ pub const Pane = struct {
         self.renderer.invalidate();
         self.restartBlink();
         self.sendFocus("in");
-
-        // The terminal follows its owner's size: take it, then ask again
-        // for the size that fits this widget.
-        self.services.client.send("session.own_block", .{
-            .session_id = self.session_id,
-            .block_ids = &[_][]const u8{self.block_id},
-            .mode = "take",
-        });
-        self.requested_cols = 0;
-        self.requestGridSize();
-        self.pushTheme();
         self.markDirty();
     }
 
     /// Set the terminal's default colors to match the desktop's light or
     /// dark style. Applies while we own the block.
     pub fn pushTheme(self: *Pane) void {
+        if (!self.owned) return;
         const theme = if (self.services.dark) dark_theme else light_theme;
         self.services.client.send("com.superlogical.terminal.set_theme", .{
             .session_id = self.session_id,
@@ -607,6 +663,11 @@ pub const TerminalWidget = extern struct {
         });
     }
 
+    fn map(self: *TerminalWidget) callconv(.c) void {
+        gtk.Widget.virtual_methods.map.call(Class.parent, self.as(gtk.Widget));
+        if (self.pane) |pane| pane.markDirty();
+    }
+
     fn dispose(self: *TerminalWidget) callconv(.c) void {
         self.setTexture(null);
         gobject.Object.virtual_methods.dispose.call(Class.parent, self.as(Parent));
@@ -620,6 +681,7 @@ pub const TerminalWidget = extern struct {
         fn init(class: *Class) callconv(.c) void {
             gtk.Widget.virtual_methods.size_allocate.implement(class, &sizeAllocate);
             gtk.Widget.virtual_methods.snapshot.implement(class, &snapshot);
+            gtk.Widget.virtual_methods.map.implement(class, &map);
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
         }
 
