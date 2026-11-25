@@ -35,6 +35,10 @@ const Resolved = struct {
 };
 
 pub const Keys = struct {
+    /// The server's configuration file, from the last keymap. Lives in
+    /// `arena`.
+    config_path: []const u8 = "",
+    config_exists: bool = false,
     gpa: Allocator,
     app: *App,
     /// Owns everything in `resolved`.
@@ -123,7 +127,7 @@ pub const Keys = struct {
             diagnostics: ?[]const struct { severity: []const u8, message: []const u8, source: ?[]const u8 = null } = null,
             actions: ?[]const struct { name: []const u8 } = null,
             modes: ?[]const Mode = null,
-            config: struct { hash: []const u8 = "" } = .{},
+            config: struct { hash: []const u8 = "", path: []const u8 = "", exists: bool = false } = .{},
         };
         if (msg.kind.response.err) |e| {
             log.warn("client.keymap failed: {s}; using built-in bindings", .{e.message});
@@ -179,7 +183,10 @@ pub const Keys = struct {
             .server_actions = server_actions,
             .hash = a.dupe(u8, res.config.hash) catch "",
         };
+        self.config_path = a.dupe(u8, res.config.path) catch "";
+        self.config_exists = res.config.exists;
         self.resetPrefix();
+        self.app.keymapLoaded();
         log.info("keymap: {d} bindings, {d} server actions, {d} modes", .{ list.items.len, server_actions.count(), modes.len });
     }
 

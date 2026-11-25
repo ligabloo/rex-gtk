@@ -73,6 +73,13 @@ pub const Machine = struct {
     addresses: [][]u8,
     is_local: bool,
     client_label: ?[]u8,
+    /// This computer only: start the server when it isn't running.
+    autostart: bool = true,
+    /// The host's entry from hosts.list as JSON, so an edit can send back
+    /// fields this client doesn't know. Null for this computer.
+    host_json: ?[]u8 = null,
+    /// Declared in the configuration file, so not editable here.
+    from_config: bool = false,
 
     state: State = .idle,
     /// Why the machine can't be reached, for its warning's tooltip.
@@ -138,6 +145,7 @@ pub const Machine = struct {
         freeOpt(gpa, &self.endpoint_text);
         freeOpt(gpa, &self.host_id);
         freeOpt(gpa, &self.last_error);
+        freeOpt(gpa, &self.host_json);
         self.clearSessions();
         self.sessions.deinit(gpa);
         gpa.destroy(self);
@@ -193,6 +201,35 @@ pub const Machine = struct {
     /// The name to show for the machine.
     pub fn title(self: *const Machine) []const u8 {
         return self.label;
+    }
+
+    /// How the machine is reached, from its first address.
+    pub fn kind(self: *const Machine) endpoint.Kind {
+        if (self.is_local) return .local;
+        if (self.addresses.len == 0) return .direct;
+        const c = endpoint.parse(self.addresses[0]) catch return .direct;
+        return c.kind();
+    }
+
+    /// Whether any of the machine's addresses goes through ssh.
+    pub fn usesSsh(self: *const Machine) bool {
+        for (self.addresses) |a| if (std.mem.startsWith(u8, a, "ssh://")) return true;
+        return false;
+    }
+
+    /// Change the name this client gives the server, now and on reconnects.
+    pub fn setClientLabel(self: *Machine, label: []const u8) void {
+        const copy = self.gpa.dupe(u8, label) catch return;
+        if (self.client_label) |old| self.gpa.free(old);
+        self.client_label = copy;
+        self.send("client.set_label", .{ .label = label });
+    }
+
+    pub fn setHostJson(self: *Machine, json_text: []const u8, from_config: bool) void {
+        const copy = self.gpa.dupe(u8, json_text) catch return;
+        freeOpt(self.gpa, &self.host_json);
+        self.host_json = copy;
+        self.from_config = from_config;
     }
 
     // ------------------------------------------------------------------
@@ -329,7 +366,7 @@ pub const Machine = struct {
         self.failures += 1;
         self.setState(.offline, why);
         // This computer's server may simply not be running yet.
-        if (self.is_local and self.failures <= 2) startLocalServer();
+        if (self.is_local and self.autostart and self.failures <= 2) startLocalServer();
         const delay: c_uint = if (self.is_local)
             @min(5000, @as(c_uint, 250) << @intCast(@min(self.failures, 5)))
         else
@@ -507,8 +544,8 @@ pub const Machine = struct {
                 if (self.tunnel == t) self.tunnel = null;
                 if (self.job) |j| j.machine = null;
                 self.job = null;
-                const kind = e.kind orelse .other;
-                switch (kind) {
+                const why = e.kind orelse .other;
+                switch (why) {
                     .host_key => self.noteError("{s}'s host key isn't trusted yet. Click to connect and check it.", .{address}),
                     .rex_not_found => self.noteError("Rex isn't installed on {s}, or isn't on the PATH of a non-interactive shell there.", .{address}),
                     .connect, .other => self.noteError("{s}", .{if (e.reason.len > 0) e.reason else "ssh stopped."}),

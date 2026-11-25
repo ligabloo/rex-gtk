@@ -16,6 +16,7 @@ const Incoming = @import("client.zig").Incoming;
 const machine_mod = @import("machine.zig");
 const Machine = machine_mod.Machine;
 const Settings = @import("settings.zig").Settings;
+const Prefs = @import("prefs/window.zig").Prefs;
 const tv = @import("terminal_view.zig");
 const api = @import("api.zig");
 const SessionView = @import("session_view.zig").SessionView;
@@ -45,6 +46,8 @@ pub const Startup = struct {
     local_address: []const u8,
     /// XDG_CONFIG_HOME, or HOME/.config; null if neither is set.
     config_home: ?[]const u8 = null,
+    /// This computer's name, the client's label unless one is set.
+    hostname: ?[]const u8 = null,
     ssh_env: core.ssh.Env = .{ .ssh_auth_sock = null, .xdg_runtime_dir = null, .home = null },
 };
 
@@ -96,6 +99,8 @@ pub const App = struct {
     want: ?Want = null,
     /// --session applies to the first connection only.
     session_option_used: bool = false,
+    /// The Preferences window, while it's open.
+    prefs: ?*Prefs = null,
 
     pub fn create(gpa: Allocator, io: std.Io, startup: Startup, options: Options) !*App {
         const self = try gpa.create(App);
@@ -245,7 +250,7 @@ pub const App = struct {
             &.{ .{ "New Tab", "client.tab.new" }, .{ "New Session", "session.new" } },
             &.{ .{ "Split Right", "pane.split.right" }, .{ "Split Down", "pane.split.down" }, .{ "Zoom Pane", "pane.zoom" }, .{ "Float Pane", "pane.float" }, .{ "Close Pane", "pane.close" } },
             &.{ .{ "Rename Tab…", "client.tab.rename" }, .{ "Rename Pane…", "pane.rename" }, .{ "Rename Session…", "session.rename" }, .{ "Close Session…", "session.close" } },
-            &.{ .{ "Toggle Sidebar", "client.sidebar.toggle" }, .{ "Full Screen", "client.window.fullscreen.toggle" } },
+            &.{ .{ "Toggle Sidebar", "client.sidebar.toggle" }, .{ "Full Screen", "client.window.fullscreen.toggle" }, .{ "Preferences", "client.preferences" } },
         };
         const menu = gio.Menu.new();
         inline for (sections) |items| {
@@ -327,6 +332,9 @@ pub const App = struct {
     }
 
     fn onShutdown(_: *adw.Application, self: *App) callconv(.c) void {
+        if (self.prefs) |p| p.destroy();
+        self.prefs = null;
+        self.settings.unsubscribe(self);
         if (self.view) |v| v.destroy();
         self.view = null;
         for (self.machines.items) |m| m.destroy();
@@ -429,14 +437,23 @@ pub const App = struct {
             }
         };
 
+        // Or show the session shown last time, if asked to.
+        if (self.options.session == null and std.mem.eql(u8, self.settings.getString("startup.session", "server"), "last")) {
+            const mid = self.settings.getString("startup.last_machine", "");
+            const sid = self.settings.getString("startup.last_session", "");
+            if (mid.len > 0 and sid.len > 0) self.setWant(mid, sid);
+        }
+        self.settings.subscribe(.{ .ctx = self, .func = onSettingChanged });
+
         const local = try Machine.create(self.gpa, self.io, self.machineListener(), .{
             .id = "local",
             .label = "This Computer",
             .addresses = &.{self.startup.local_address},
             .is_local = true,
-            .client_label = self.options.label,
+            .client_label = self.clientLabel(),
         });
         errdefer local.destroy();
+        local.autostart = self.settings.getBool("startup.start_server", true);
         try self.machines.append(self.gpa, local);
         local.connect(false);
     }
@@ -523,6 +540,12 @@ pub const App = struct {
             };
         };
         return path;
+    }
+
+    /// The ssh agent socket the settings choose, or null for none.
+    /// Caller frees.
+    pub fn sshAgentSocket(self: *App, gpa: Allocator) ?[]u8 {
+        return sshAgent(self, gpa);
     }
 
     fn dialogParent(ctx: *anyopaque) ?*gtk.Widget {
@@ -629,6 +652,7 @@ pub const App = struct {
     fn onMachineChanged(ctx: *anyopaque, m: *Machine) void {
         const self: *App = @ptrCast(@alignCast(ctx));
         self.rebuildSidebar();
+        if (self.prefs) |p| p.machinesChanged();
         if (self.view == null and self.statusMachine() == m) self.showMachineStatus(m);
     }
 
@@ -659,6 +683,61 @@ pub const App = struct {
     }
 
     // ------------------------------------------------------------------
+    // Preferences
+
+    pub fn showPreferences(self: *App) void {
+        if (self.prefs) |p| return p.present();
+        self.prefs = Prefs.create(self) catch |err| {
+            log.err("opening Preferences failed: {}", .{err});
+            return;
+        };
+        self.prefs.?.present();
+    }
+
+    /// The Preferences window closed and freed itself.
+    pub fn prefsClosed(self: *App) void {
+        self.prefs = null;
+    }
+
+    /// The keymap, and with it the configuration file's path, arrived.
+    pub fn keymapLoaded(self: *App) void {
+        if (self.prefs) |p| p.serverChanged();
+    }
+
+    /// How this client names itself to servers: --label, the setting, or
+    /// the computer's name.
+    pub fn clientLabel(self: *App) ?[]const u8 {
+        if (self.options.label) |l| return l;
+        const set = self.settings.getString("client.label", "");
+        if (set.len > 0) return set;
+        return self.startup.hostname;
+    }
+
+    fn onSettingChanged(ctx: *anyopaque, key: []const u8) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const eq = std.mem.eql;
+        if (eq(u8, key, "client.label")) {
+            const label = self.clientLabel() orelse return;
+            for (self.machines.items) |m| m.setClientLabel(label);
+        } else if (eq(u8, key, "startup.start_server")) {
+            self.localMachine().autostart = self.settings.getBool(key, true);
+        } else if (eq(u8, key, "ssh.agent") or eq(u8, key, "ssh.agent_path")) {
+            self.retrySsh();
+        }
+    }
+
+    /// Try again every ssh machine that can't be reached, as after the
+    /// ssh agent changed.
+    pub fn retrySsh(self: *App) void {
+        for (self.machines.items) |m| if (m.usesSsh() and m.state == .offline) m.connect(false);
+    }
+
+    /// Try again every machine that can't be reached.
+    pub fn retryOffline(self: *App) void {
+        for (self.machines.items) |m| if (m.state == .offline) m.connect(false);
+    }
+
+    // ------------------------------------------------------------------
     // Hosts
 
     fn refreshHosts(self: *App) void {
@@ -675,6 +754,9 @@ pub const App = struct {
         const list = api.parse(api.Hosts, msg) orelse return;
         const hosts = list.hosts orelse &.{};
         const local = self.localMachine();
+        // The same entries untyped, to send back fields we don't know.
+        const raw = api.parse(struct { hosts: ?[]const std.json.Value = null }, msg);
+        const raw_hosts: []const std.json.Value = if (raw) |r| r.hosts orelse &.{} else &.{};
 
         // Drop machines whose host is gone.
         var i: usize = 1;
@@ -691,12 +773,19 @@ pub const App = struct {
             self.removeMachine(m);
         }
 
-        for (hosts) |h| {
+        for (hosts, 0..) |h, hi| {
             if (h.id.len == 0) continue;
             // This computer may be in its own list, by its tailnet name.
             if (h.host_id) |hid| if (local.host_id) |lid| if (std.mem.eql(u8, hid, lid)) continue;
             const endpoints = h.endpoints orelse &.{};
+            const json_text: ?[]u8 = if (hi < raw_hosts.len)
+                std.json.Stringify.valueAlloc(self.gpa, raw_hosts[hi], .{}) catch null
+            else
+                null;
+            defer if (json_text) |t| self.gpa.free(t);
+            const from_config = h.source != null and h.source.? != .null;
             if (self.machineById(h.id)) |m| {
+                if (json_text) |t| m.setHostJson(t, from_config);
                 m.update(h.label, h.icon, endpoints);
                 continue;
             }
@@ -705,8 +794,9 @@ pub const App = struct {
                 .label = h.label,
                 .icon = h.icon,
                 .addresses = endpoints,
-                .client_label = self.options.label,
+                .client_label = self.clientLabel(),
             }) catch continue;
+            if (json_text) |t| m.setHostJson(t, from_config);
             self.machines.append(self.gpa, m) catch {
                 m.destroy();
                 continue;
@@ -714,6 +804,7 @@ pub const App = struct {
             m.connect(false);
         }
         self.rebuildSidebar();
+        if (self.prefs) |p| p.machinesChanged();
     }
 
     fn removeMachine(self: *App, m: *Machine) void {
@@ -767,6 +858,8 @@ pub const App = struct {
         };
         view.window_active = self.windowActive();
         self.view = view;
+        self.settings.setString("startup.last_machine", m.id);
+        self.settings.setString("startup.last_session", session_id);
         self.content.?.setContent(view.tab_view.as(gtk.Widget));
         self.tab_bar.?.setView(view.tab_view);
         self.selectCurrentRow();
@@ -1002,6 +1095,8 @@ pub const App = struct {
             self.keys.changed(p.hash);
         } else if (eq(u8, ev.name, "hosts_changed")) {
             if (m.is_local) self.refreshHosts();
+        } else if (eq(u8, ev.name, "tailscale_status_changed")) {
+            if (m.is_local) if (self.prefs) |p| p.serverChanged();
         } else if (eq(u8, ev.name, "client_perform_requested")) {
             self.performRequested(m, msg, ev.payload);
         } else if (eq(u8, ev.name, "client_prompt_requested")) {
@@ -1036,6 +1131,10 @@ pub const App = struct {
             args: std.json.Value = .null,
         }, msg, payload) orelse return;
         const Err = struct { code: []const u8, message: []const u8 };
+        if (!self.settings.getBool("client.remote_control", true)) {
+            const e: Err = .{ .code = "refused", .message = "remote control is turned off in rex-gtk's preferences" };
+            return m.send("client.reply", .{ .call_id = req.call_id, .@"error" = e });
+        }
         if (std.mem.startsWith(u8, req.action, "client.mode.")) {
             self.keys.perform(req.action, req.args, "api");
             return m.send("client.reply", .{ .call_id = req.call_id, .result = std.json.Value.null });

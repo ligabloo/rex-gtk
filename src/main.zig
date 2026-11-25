@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Name this client after the machine unless told otherwise, so
     // `rex -C <hostname> do …` reaches it.
     var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    if (options.label == null) options.label = std.posix.gethostname(&host_buf) catch null;
+    const hostname: ?[]const u8 = std.posix.gethostname(&host_buf) catch null;
 
     // This computer's server: REX_SERVER if set, as the rex CLI does.
     const env = init.environ_map;
@@ -66,6 +66,7 @@ pub fn main(init: std.process.Init) !u8 {
     const app = try App.create(gpa, io, .{
         .local_address = local_address,
         .config_home = config_home,
+        .hostname = hostname,
         .ssh_env = .{
             .ssh_auth_sock = env.get("SSH_AUTH_SOCK"),
             .xdg_runtime_dir = env.get("XDG_RUNTIME_DIR"),

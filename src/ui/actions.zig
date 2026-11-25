@@ -84,6 +84,9 @@ pub const all = [_]Action{
     .{ .name = "client.font.reset", .title = "Reset Font Size", .category = "View" },
     .{ .name = "client.window.fullscreen.toggle", .title = "Toggle Full Screen", .category = "Window" },
     .{ .name = "client.close", .title = "Close", .category = "Window" },
+    .{ .name = "client.preferences", .title = "Preferences", .category = "Window", .args =
+    \\{"type":"object","properties":{"page":{"enum":["server","general","machines"],"type":"string","description":"The page to show."},"machine":{"type":"string","description":"On the Machines page, the machine whose details to show, by name."}}}
+    },
 };
 
 pub fn find(name: []const u8) ?Action {
@@ -114,6 +117,13 @@ pub fn perform(app: *App, name: []const u8, args: std.json.Value) Error!void {
     }
     if (eq(u8, name, "client.close")) {
         (app.window orelse return error.NoTarget).as(gtk.Window).close();
+        return;
+    }
+    if (eq(u8, name, "client.preferences")) {
+        app.showPreferences();
+        const prefs = app.prefs orelse return;
+        if (argString(args, "page")) |page| prefs.showPageNamed(page) catch return error.BadArgs;
+        if (argString(args, "machine")) |m| prefs.showMachine(m) catch return error.BadArgs;
         return;
     }
     if (eq(u8, name, "client.font.increase")) return app.setFontSize(app.font_size + 1);

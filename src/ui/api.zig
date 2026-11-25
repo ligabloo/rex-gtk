@@ -91,6 +91,33 @@ pub const Bootstrap = struct {
     server_status: ?struct { host_id: ?[]const u8 = null } = null,
 };
 
+/// The status of the server's built-in Tailscale node.
+pub const Tailscale = struct {
+    /// disabled, starting, needs_login, needs_machine_approval or running.
+    state: []const u8 = "disabled",
+    @"error": ?[]const u8 = null,
+    dns_name: ?[]const u8 = null,
+    auth_url: ?[]const u8 = null,
+    account: ?struct { login_name: []const u8 = "" } = null,
+    tailnet_name: ?[]const u8 = null,
+    allow_tailnet_members: bool = false,
+    https: ?struct { state: []const u8 = "", url: ?[]const u8 = null } = null,
+    control_url: ?[]const u8 = null,
+};
+
+/// `server.status`, as much of it as the Server page shows.
+pub const ServerStatus = struct {
+    pid: u64 = 0,
+    started_at: []const u8 = "",
+    session_count: u64 = 0,
+    tailscale: ?Tailscale = null,
+    listeners: ?[]const struct {
+        endpoint: []const u8,
+        transport: []const u8 = "",
+        primary: bool = false,
+    } = null,
+};
+
 /// `hosts.list`: the other Rex servers the user connects to.
 pub const Hosts = struct {
     hosts: ?[]const Host = null,
@@ -101,6 +128,8 @@ pub const Hosts = struct {
         endpoints: ?[]const []const u8 = null,
         icon: ?[]const u8 = null,
         host_id: ?[]const u8 = null,
+        /// Where the host was declared, such as the configuration file.
+        source: ?std.json.Value = null,
     };
 };
 

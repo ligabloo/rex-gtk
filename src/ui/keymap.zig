@@ -193,6 +193,7 @@ pub const defaults = [_]Binding{
     .{ .keys = &.{"ctrl+-"}, .action = "client.font.decrease" },
     .{ .keys = &.{"ctrl+0"}, .action = "client.font.reset" },
     .{ .keys = &.{"f11"}, .action = "client.window.fullscreen.toggle" },
+    .{ .keys = &.{"ctrl+,"}, .action = "client.preferences" },
 };
 
 test "parse and match" {
