@@ -62,3 +62,42 @@ events only while the program has turned on mouse reporting and Shift isn't held
 - `desktop_notification` `{title, body}`: OSC 9 and OSC 777.
 - `selection_copied`: only for server-side selection, which rex-gtk doesn't use.
 - Also sent: `size_changed`, `process_changed`, `pwd_changed`, `ports_changed`, `progress_report`.
+
+## Reaching other servers
+
+How `rex -S ADDRESS` connects (seen with `rex -vvv`, preview.23):
+
+- A bare host name is probed as `https://HOST`, `https://HOST:7297`, then
+  `http://HOST:7297`. A value with a port is always an address.
+- `ssh://[USER@]HOST[:PORT]` runs the system `ssh` (ControlMaster, BatchMode)
+  and first asks the remote for `rex server status --json`.
+
+Apps don't drive `ssh` themselves. They run
+`rex __internal ssh-tunnel [--no-prompt] ssh://HOST`, which keeps the
+connection open until its standard input closes and talks JSON lines:
+
+| Direction | Message |
+| --- | --- |
+| out | `{"type":"prompt","id":"1","kind":"confirm","text":"…","pid":N}`: one of ssh's questions, such as trusting a host key |
+| in | `{"type":"answer","id":"1","answer":"yes"}` |
+| out | `{"type":"done","id":"1","reason":"answered"}` or `"canceled"` |
+| out | `{"type":"exit","reason":"…","error_kind":"connect"}`; also `host_key`. Without `error_kind` when standard input closed |
+
+When the tunnel is up it prints one line and then stays quiet:
+
+```json
+{"type":"ready","version":1,"network":"unix","socket":"/run/user/1000/rex/ssh/3baa….sock","mode":"forward","host":"ssh://HOST","remote_socket":"/run/user/1000/rex/server.sock"}
+```
+
+`socket` is a local Unix socket that carries both control and data
+connections, so the rest of the client treats the host like a local server.
+
+Other `error_kind` values seen: `rex_not_found`, when `rex` is neither on the
+remote's non-interactive PATH nor in `~/.local/bin`. The helper starts the
+remote server if it isn't running.
+
+An ssh agent that is locked makes ssh wait without any output, so nothing
+arrives from the helper. Time the connect out on our side.
+
+`rex server tailscale pair --json` gives the address the pairing QR code
+holds. It is only the tailnet HTTPS address, not a credential.

@@ -112,7 +112,7 @@ pub const Stream = struct {
         var end: End = .{};
         defer self.postEnded(end);
 
-        const dc = data.DataConn.open(self.gpa, self.io, self.socket_path, self.ticket, data.terminal_subprotocol) catch |err| {
+        const dc = data.DataConn.open(self.gpa, self.io, .{ .unix = self.socket_path }, self.ticket, data.terminal_subprotocol) catch |err| {
             log.warn("opening data connection failed: {}", .{err});
             end.open_failed = true;
             return;

@@ -47,7 +47,7 @@ pub const Client = struct {
         reconnect_token: ?[]const u8,
         handler: Handler,
     ) !*Client {
-        const ctl = try control.Control.connect(gpa, io, socket_path, .{ .info = info, .reconnect_token = reconnect_token });
+        const ctl = try control.Control.connect(gpa, io, .{ .unix = socket_path }, .{ .info = info, .reconnect_token = reconnect_token });
         errdefer ctl.destroy();
         const self = try gpa.create(Client);
         self.* = .{

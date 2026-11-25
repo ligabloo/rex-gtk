@@ -11,6 +11,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const json = std.json;
 const ws = @import("ws.zig");
+const endpoint = @import("endpoint.zig");
 
 const log = std.log.scoped(.control);
 
@@ -101,8 +102,8 @@ pub const Control = struct {
         reconnect_token: ?[]const u8 = null,
     };
 
-    pub fn connect(gpa: Allocator, io: Io, socket_path: []const u8, options: ConnectOptions) !*Control {
-        const conn = try ws.Conn.connectUnix(gpa, io, socket_path, .{
+    pub fn connect(gpa: Allocator, io: Io, ep: endpoint.Endpoint, options: ConnectOptions) !*Control {
+        const conn = try ws.Conn.connect(gpa, io, ep, .{
             .path = "/api/control",
             .subprotocol = subprotocol,
         });
@@ -330,6 +331,30 @@ fn copyInto(buf: []u8, s: []const u8) usize {
     const n = @min(buf.len, s.len);
     @memcpy(buf[0..n], s[0..n]);
     return n;
+}
+
+/// Connect to the first endpoint of `address` that a Rex server answers
+/// on. `chosen` is set to it, for opening data connections later. A server
+/// that refuses us ends the search: trying without TLS wouldn't help.
+pub fn connectAny(
+    gpa: Allocator,
+    io: Io,
+    candidates: []const endpoint.Endpoint,
+    options: Control.ConnectOptions,
+    chosen: *endpoint.Endpoint,
+) !*Control {
+    var last: anyerror = error.NoEndpoints;
+    for (candidates) |ep| {
+        const ctl = Control.connect(gpa, io, ep, options) catch |err| {
+            log.info("{f}: {t}", .{ ep, err });
+            if (err == error.Forbidden) return err;
+            last = err;
+            continue;
+        };
+        chosen.* = ep;
+        return ctl;
+    }
+    return last;
 }
 
 /// The server's socket path: REX_SERVER if it names a Unix socket, else

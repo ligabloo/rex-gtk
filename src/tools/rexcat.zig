@@ -41,12 +41,19 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const block = block_id orelse return fail(io, usage);
 
+    // REX_SERVER takes any address `rex -S` does, except ssh://.
     const socket_path = try control.defaultSocketPath(gpa, init.environ_map);
     defer gpa.free(socket_path);
-
-    const ctl = try control.Control.connect(gpa, io, socket_path, .{
+    var candidates: core.endpoint.Candidates = .{};
+    candidates.buf[0] = .{ .unix = socket_path };
+    candidates.len = 1;
+    if (init.environ_map.get("REX_SERVER")) |server| {
+        candidates = core.endpoint.parse(server) catch return fail(io, "REX_SERVER is not an address\n");
+    }
+    var ep: core.endpoint.Endpoint = undefined;
+    const ctl = try control.connectAny(gpa, io, candidates.slice(), .{
         .info = .{ .kind = "cli", .name = "rexcat" },
-    });
+    }, &ep);
     defer ctl.destroy();
     defer ctl.close();
 
@@ -88,7 +95,7 @@ pub fn main(init: std.process.Init) !u8 {
         return fail(io, "no terminal block with that ID in any session\n");
     };
 
-    const dc = try core.data.DataConn.open(gpa, io, socket_path, ticket.ticket, core.data.terminal_subprotocol);
+    const dc = try core.data.DataConn.open(gpa, io, ep, ticket.ticket, core.data.terminal_subprotocol);
     defer dc.destroy();
     defer dc.close();
 

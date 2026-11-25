@@ -1,4 +1,4 @@
-//! A small RFC 6455 WebSocket client over a Unix domain socket.
+//! A small RFC 6455 WebSocket client over a Unix domain socket, TCP or TLS.
 //!
 //! Only what Rex needs: one connection per socket, no extensions (we never
 //! offer permessage-deflate), text and binary messages, ping/pong and close.
@@ -10,7 +10,27 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+const endpoint = @import("endpoint.zig");
+
 const log = std.log.scoped(.ws);
+const tls = std.crypto.tls;
+
+/// The system's root certificates, read the first time a TLS connection
+/// needs them and shared by every connection after that.
+var ca_bundle: std.crypto.Certificate.Bundle = .empty;
+var ca_bundle_lock: Io.RwLock = .init;
+var ca_bundle_loaded: bool = false;
+
+fn loadCaBundle(io: Io) !void {
+    try ca_bundle_lock.lock(io);
+    defer ca_bundle_lock.unlock(io);
+    if (ca_bundle_loaded) return;
+    ca_bundle.rescan(std.heap.page_allocator, io, Io.Clock.real.now(io)) catch |err| {
+        log.warn("reading the system's root certificates failed: {t}", .{err});
+        return error.TlsFailed;
+    };
+    ca_bundle_loaded = true;
+}
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -35,6 +55,8 @@ pub const Error = error{
     MessageTooLarge,
     /// The HTTP upgrade failed. See the log for the status line.
     HandshakeFailed,
+    /// The server answered 403: its access rules don't let us in.
+    Forbidden,
 } || Io.Reader.Error || Io.Writer.Error || Allocator.Error;
 
 /// The longest control frame payload the protocol allows.
@@ -45,6 +67,11 @@ pub const Conn = struct {
     stream: Io.net.Stream,
     reader: Io.net.Stream.Reader,
     writer: Io.net.Stream.Writer,
+    /// Where frames are read from and written to: the socket itself, or
+    /// the TLS session on top of it.
+    r: *Io.Reader,
+    w: *Io.Writer,
+    tls_state: ?*Tls = null,
     write_mutex: Io.Mutex = .init,
 
     /// Payload bytes of the current data frame that haven't been read yet.
@@ -60,7 +87,14 @@ pub const Conn = struct {
     close_sent: bool = false,
 
     read_buf: [64 * 1024]u8 = undefined,
-    write_buf: [16 * 1024]u8 = undefined,
+    // At least one TLS record, which is what the TLS client needs.
+    write_buf: [32 * 1024]u8 = undefined,
+
+    const Tls = struct {
+        client: tls.Client,
+        read_buf: [tls.Client.min_buffer_len]u8 = undefined,
+        write_buf: [tls.Client.min_buffer_len]u8 = undefined,
+    };
 
     pub const ConnectOptions = struct {
         /// The request path, such as /api/control.
@@ -68,6 +102,89 @@ pub const Conn = struct {
         /// The value of Sec-WebSocket-Protocol to request and require.
         subprotocol: []const u8,
     };
+
+    /// Connect to wherever `ep` says. An ssh endpoint can't be connected
+    /// to directly: start its tunnel and connect to the socket it gives.
+    pub fn connect(gpa: Allocator, io: Io, ep: endpoint.Endpoint, options: ConnectOptions) !*Conn {
+        return switch (ep) {
+            .unix => |path| connectUnix(gpa, io, path, options),
+            .tcp => |t| connectTcp(gpa, io, t, options),
+            .ssh => error.NeedsTunnel,
+        };
+    }
+
+    /// Connect over TCP, with TLS if the endpoint says so, and perform the
+    /// WebSocket upgrade. Free with `destroy`.
+    pub fn connectTcp(gpa: Allocator, io: Io, t: endpoint.Tcp, options: ConnectOptions) !*Conn {
+        // Zig 0.17's threaded Io can't time a connect out yet, so this
+        // waits as long as the kernel does. Callers connect from a worker
+        // thread and stop waiting on their own.
+        const connect_options: Io.net.IpAddress.ConnectOptions = .{ .mode = .stream };
+        const stream = if (Io.net.IpAddress.parse(t.host, t.port)) |address|
+            try address.connect(io, connect_options)
+        else |_| stream: {
+            const name = Io.net.HostName.init(t.host) catch return error.BadHostName;
+            break :stream try name.connect(io, t.port, connect_options);
+        };
+        errdefer stream.close(io);
+
+        const self = try gpa.create(Conn);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .io = io,
+            .stream = stream,
+            .reader = undefined,
+            .writer = undefined,
+            .r = undefined,
+            .w = undefined,
+        };
+        self.reader = stream.reader(io, &self.read_buf);
+        self.writer = stream.writer(io, &self.write_buf);
+        self.r = &self.reader.interface;
+        self.w = &self.writer.interface;
+
+        errdefer if (self.tls_state) |state| gpa.destroy(state);
+        if (t.tls) {
+            try loadCaBundle(io);
+            const state = try gpa.create(Tls);
+            self.tls_state = state;
+            var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+            io.random(&entropy);
+            state.* = .{ .client = tls.Client.init(&self.reader.interface, &self.writer.interface, .{
+                .host = .{ .explicit = t.host },
+                .ca = .{ .bundle = .{
+                    .gpa = std.heap.page_allocator,
+                    .io = io,
+                    .lock = &ca_bundle_lock,
+                    .bundle = &ca_bundle,
+                } },
+                .read_buffer = &state.read_buf,
+                .write_buffer = &state.write_buf,
+                .entropy = &entropy,
+                .realtime_now = Io.Clock.real.now(io),
+                // A WebSocket ends with a close frame, so a cut connection
+                // is noticed without TLS's own end marker.
+                .allow_truncation_attacks = true,
+            }) catch |err| {
+                log.info("TLS with {s}:{d} failed: {t}", .{ t.host, t.port, err });
+                return error.TlsFailed;
+            } };
+            self.r = &state.client.reader;
+            self.w = &state.client.writer;
+        }
+
+        var host_buf: [300]u8 = undefined;
+        const default_port: u16 = if (t.tls) 443 else 80;
+        const v6 = std.mem.indexOfScalar(u8, t.host, ':') != null;
+        const host = if (t.port == default_port and !v6)
+            t.host
+        else if (v6)
+            std.fmt.bufPrint(&host_buf, "[{s}]:{d}", .{ t.host, t.port }) catch return error.BadHostName
+        else
+            std.fmt.bufPrint(&host_buf, "{s}:{d}", .{ t.host, t.port }) catch return error.BadHostName;
+        try self.handshake(options, host);
+        return self;
+    }
 
     /// Connect to a Unix socket and perform the WebSocket upgrade. The
     /// returned connection is heap-allocated because its reader and writer
@@ -89,11 +206,15 @@ pub const Conn = struct {
             .stream = stream,
             .reader = undefined,
             .writer = undefined,
+            .r = undefined,
+            .w = undefined,
         };
         self.reader = stream.reader(io, &self.read_buf);
         self.writer = stream.writer(io, &self.write_buf);
+        self.r = &self.reader.interface;
+        self.w = &self.writer.interface;
 
-        try self.handshake(options);
+        try self.handshake(options, "localhost");
         return self;
     }
 
@@ -101,6 +222,7 @@ pub const Conn = struct {
     /// a clean close.
     pub fn destroy(self: *Conn, gpa: Allocator) void {
         self.stream.close(self.io);
+        if (self.tls_state) |state| gpa.destroy(state);
         gpa.destroy(self);
     }
 
@@ -113,31 +235,39 @@ pub const Conn = struct {
         return self.close_reason_buf[0..self.close_reason_len];
     }
 
-    fn handshake(self: *Conn, options: ConnectOptions) !void {
+    /// Send what's buffered all the way to the socket. With TLS the frames
+    /// first become records in the socket's own buffer.
+    fn flush(self: *Conn) Io.Writer.Error!void {
+        try self.w.flush();
+        if (self.tls_state != null) try self.writer.interface.flush();
+    }
+
+    fn handshake(self: *Conn, options: ConnectOptions, host: []const u8) !void {
         var key_bytes: [16]u8 = undefined;
         self.io.random(&key_bytes);
         var key_buf: [24]u8 = undefined;
         const key = std.base64.standard.Encoder.encode(&key_buf, &key_bytes);
 
-        const w = &self.writer.interface;
+        const w = self.w;
         try w.print(
             "GET {s} HTTP/1.1\r\n" ++
-                "Host: localhost\r\n" ++
+                "Host: {s}\r\n" ++
                 "Upgrade: websocket\r\n" ++
                 "Connection: Upgrade\r\n" ++
                 "Sec-WebSocket-Key: {s}\r\n" ++
                 "Sec-WebSocket-Version: 13\r\n" ++
                 "Sec-WebSocket-Protocol: {s}\r\n" ++
                 "\r\n",
-            .{ options.path, key, options.subprotocol },
+            .{ options.path, host, key, options.subprotocol },
         );
-        try w.flush();
+        try self.flush();
 
         var expected_accept_buf: [28]u8 = undefined;
         const expected_accept = acceptKey(&expected_accept_buf, key);
 
-        const r = &self.reader.interface;
+        const r = self.r;
         const status_line = trimCr(try r.takeDelimiterInclusive('\n'));
+        if (std.mem.startsWith(u8, status_line, "HTTP/1.1 403")) return error.Forbidden;
         if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 101")) {
             log.err("upgrade to {s} refused: {s}", .{ options.path, status_line });
             return error.HandshakeFailed;
@@ -196,7 +326,7 @@ pub const Conn = struct {
         self.io.random(&mask);
         @memcpy(header[header_len..][0..4], &mask);
 
-        const w = &self.writer.interface;
+        const w = self.w;
         try w.writeAll(header[0 .. header_len + 4]);
 
         // Mask through a small stack buffer so the caller's payload stays
@@ -211,7 +341,7 @@ pub const Conn = struct {
             try w.writeAll(chunk[0..n]);
             offset += n;
         }
-        try w.flush();
+        try self.flush();
     }
 
     // ------------------------------------------------------------------
@@ -234,7 +364,7 @@ pub const Conn = struct {
             if (data.items.len + self.frame_remaining > max_len) return error.MessageTooLarge;
             const n: usize = @intCast(self.frame_remaining);
             try data.ensureUnusedCapacity(gpa, n);
-            try self.reader.interface.readSliceAll(data.unusedCapacitySlice()[0..n]);
+            try self.r.readSliceAll(data.unusedCapacitySlice()[0..n]);
             data.items.len += n;
             self.frame_remaining = 0;
             if (self.frame_fin) break;
@@ -247,7 +377,7 @@ pub const Conn = struct {
     /// `continuation` says whether we're in the middle of a message.
     fn nextDataFrame(self: *Conn, continuation: bool) Error!Opcode {
         std.debug.assert(self.frame_remaining == 0);
-        const r = &self.reader.interface;
+        const r = self.r;
         while (true) {
             const head = try r.takeArray(2);
             const fin = head[0] & 0x80 != 0;
@@ -324,7 +454,7 @@ pub const Conn = struct {
             const max: usize = @intCast(@min(conn.frame_remaining, std.math.maxInt(usize)));
             const dest = limit.min(.limited(max)).slice(try w.writableSliceGreedy(1));
             var vec: [1][]u8 = .{dest};
-            const n = conn.reader.interface.readVec(&vec) catch |err| switch (err) {
+            const n = conn.r.readVec(&vec) catch |err| switch (err) {
                 error.EndOfStream => return error.EndOfStream,
                 error.ReadFailed => {
                     self.err = error.ReadFailed;

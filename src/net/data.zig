@@ -10,6 +10,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const ws = @import("ws.zig");
+const endpoint = @import("endpoint.zig");
 
 const log = std.log.scoped(.data);
 
@@ -58,7 +59,7 @@ pub const DataConn = struct {
     pub fn open(
         gpa: Allocator,
         io: Io,
-        socket_path: []const u8,
+        ep: endpoint.Endpoint,
         ticket: []const u8,
         subprotocol: []const u8,
     ) !*DataConn {
@@ -67,7 +68,7 @@ pub const DataConn = struct {
         if ((decoder.calcSizeForSlice(ticket) catch return error.BadTicket) != 16) return error.BadTicket;
         decoder.decode(&ticket_bytes, ticket) catch return error.BadTicket;
 
-        const conn = try ws.Conn.connectUnix(gpa, io, socket_path, .{
+        const conn = try ws.Conn.connect(gpa, io, ep, .{
             .path = "/api/data",
             .subprotocol = subprotocol,
         });

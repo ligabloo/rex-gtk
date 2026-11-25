@@ -4,6 +4,8 @@
 const std = @import("std");
 
 pub const ghostty_vt = @import("ghostty-vt");
+pub const endpoint = @import("net/endpoint.zig");
+pub const ssh = @import("net/ssh.zig");
 pub const ws = @import("net/ws.zig");
 pub const control = @import("net/control.zig");
 pub const data = @import("net/data.zig");
