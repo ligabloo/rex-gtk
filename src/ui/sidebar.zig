@@ -79,7 +79,7 @@ pub const Sidebar = struct {
         filter.setPlaceholderText("Filter");
         const spacer = gtk.Box.new(.horizontal, 0);
         spacer.as(gtk.Widget).setHexpand(1);
-        const add_machine = gtk.Button.newFromIconName("list-add-symbolic");
+        const add_machine = gtk.Button.newFromIconName("add-machine-symbolic");
         add_machine.as(gtk.Widget).setTooltipText("Add Machine…");
         add_machine.as(gtk.Widget).addCssClass("flat");
         const bottom = gtk.Box.new(.horizontal, 6);
@@ -219,7 +219,7 @@ pub const Sidebar = struct {
         box.append(label.as(gtk.Widget));
         switch (m.state) {
             .connected => {
-                const b = gtk.Button.newFromIconName("window-new-symbolic");
+                const b = gtk.Button.newFromIconName("add-session-symbolic");
                 b.as(gtk.Widget).addCssClass("flat");
                 b.as(gtk.Widget).addCssClass("row-create");
                 b.as(gtk.Widget).setTooltipText("New Session");

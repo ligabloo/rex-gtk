@@ -127,7 +127,7 @@ pub const MachinesPage = struct {
         }
         const add = adw.ButtonRow.new();
         add.as(adw.PreferencesRow).setTitle("Add Machine…");
-        add.setStartIconName("list-add-symbolic");
+        add.setStartIconName("add-machine-symbolic");
         _ = adw.ButtonRow.signals.activated.connect(add, *MachinesPage, &onAddClicked, self, .{});
         g.add(add.as(gtk.Widget));
 

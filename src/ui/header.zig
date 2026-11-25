@@ -259,7 +259,7 @@ pub const Header = struct {
             name.as(gtk.Widget).setHexpand(1);
             head.append(name.as(gtk.Widget));
             if (m.state == .connected) {
-                const b = gtk.Button.newFromIconName("window-new-symbolic");
+                const b = gtk.Button.newFromIconName("add-session-symbolic");
                 b.as(gtk.Widget).addCssClass("flat");
                 b.as(gtk.Widget).setTooltipText("New Session");
                 _ = gtk.Button.signals.clicked.connect(b, *Machine, &onNewSession, m, .{});
