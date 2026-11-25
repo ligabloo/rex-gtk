@@ -49,6 +49,11 @@ with the clipboard, and Ctrl+click opens a URL. The wheel scrolls back through t
 history; typing returns to the bottom. When a program asks for the mouse (htop, vim with
 `mouse=a`) events go to it instead; hold Shift to select text anyway.
 
+On a touchscreen, tap to focus a pane and request the desktop's on-screen keyboard. Taps
+also act as left clicks in programs with mouse reporting enabled. Drag vertically to scroll.
+Press and hold a word to select it, then drag to extend the selection. Lift your finger to
+open the pane menu, where you can copy or paste.
+
 ## Connection problems
 
 If the connection to the server drops, rex-gtk reconnects with backoff, continuing the same client

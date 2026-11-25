@@ -1,4 +1,4 @@
-//! Mouse, wheel and clipboard handling for a terminal pane.
+//! Mouse, touch, wheel and clipboard handling for a terminal pane.
 //!
 //! While the program in the terminal has mouse reporting on (and Shift
 //! isn't held), mouse and wheel events go to the server, which encodes them
@@ -47,6 +47,10 @@ pub const State = struct {
     /// Smooth-scroll pixels not yet turned into lines.
     scroll_rest: f64 = 0,
     autoscroll_id: c_uint = 0,
+    touch: enum { idle, tap, scroll, select, menu } = .idle,
+    touch_start: [2]f64 = .{ 0, 0 },
+    touch_dy: f64 = 0,
+    touch_scroll_rest: f64 = 0,
 
     pub fn deinit(self: *State, terminal: ?*Terminal) void {
         if (self.autoscroll_id != 0) _ = glib.Source.remove(self.autoscroll_id);
@@ -69,6 +73,20 @@ pub fn setup(pane: *Pane) void {
     const scroll = gtk.EventControllerScroll.new(.{ .vertical = true, .horizontal = true });
     _ = gtk.EventControllerScroll.signals.scroll.connect(scroll, *Pane, &onScroll, pane, .{});
     pane.addController(scroll.as(gtk.EventController));
+
+    const swipe = gtk.GestureDrag.new();
+    swipe.as(gtk.GestureSingle).setTouchOnly(1);
+    _ = gtk.GestureDrag.signals.drag_begin.connect(swipe, *Pane, &onTouchBegin, pane, .{});
+    _ = gtk.GestureDrag.signals.drag_update.connect(swipe, *Pane, &onTouchUpdate, pane, .{});
+    _ = gtk.GestureDrag.signals.drag_end.connect(swipe, *Pane, &onTouchEnd, pane, .{});
+    pane.addController(swipe.as(gtk.EventController));
+
+    const hold = gtk.GestureLongPress.new();
+    hold.as(gtk.GestureSingle).setTouchOnly(1);
+    _ = gtk.GestureLongPress.signals.pressed.connect(hold, *Pane, &onTouchHold, pane, .{});
+    pane.addController(hold.as(gtk.EventController));
+    // A claimed hold leaves the drag controller active to extend selection.
+    hold.as(gtk.Gesture).group(swipe.as(gtk.Gesture));
 }
 
 // ----------------------------------------------------------------------
@@ -152,11 +170,19 @@ fn sendMouse(pane: *Pane, action: []const u8, button: c_uint, cell: Cell, state:
     });
 }
 
+/// GTK can deliver touchscreen input to pointer controllers as well.
+fn fromTouchscreen(ctrl: *gtk.EventController) bool {
+    const device = ctrl.getCurrentEventDevice() orelse return false;
+    return device.getSource() == .touchscreen;
+}
+
 fn onPressed(click: *gtk.GestureClick, _: c_int, x: f64, y: f64, pane: *Pane) callconv(.c) void {
+    if (fromTouchscreen(click.as(gtk.EventController))) return;
     const widget = pane.widget.as(gtk.Widget);
     _ = widget.grabFocus();
     pane.focusOnServer();
 
+    if (pane.pointer.touch == .select) return;
     const mirror = pane.mirror orelse return;
     const t = &mirror.terminal;
     const button = click.as(gtk.GestureSingle).getCurrentButton();
@@ -199,6 +225,7 @@ fn onPressed(click: *gtk.GestureClick, _: c_int, x: f64, y: f64, pane: *Pane) ca
 }
 
 fn onReleased(click: *gtk.GestureClick, _: c_int, x: f64, y: f64, pane: *Pane) callconv(.c) void {
+    if (fromTouchscreen(click.as(gtk.EventController))) return;
     const mirror = pane.mirror orelse return;
     const t = &mirror.terminal;
     const button = click.as(gtk.GestureSingle).getCurrentButton();
@@ -210,11 +237,7 @@ fn onReleased(click: *gtk.GestureClick, _: c_int, x: f64, y: f64, pane: *Pane) c
         st.selecting = false;
         stopAutoscroll(st);
         st.gesture.release(t, .{ .pin = pinAt(t, cell) });
-        // Selecting copies to the primary selection, as on X11, and to the
-        // clipboard too if asked.
-        copyTo(pane, pane.widget.as(gtk.Widget).getPrimaryClipboard());
-        if (pane.services.settings) |s| if (s.getBool("terminal.copy_on_select", false))
-            copyTo(pane, pane.widget.as(gtk.Widget).getClipboard());
+        copySelection(pane);
         return;
     }
     const was_held = switch (button) {
@@ -229,6 +252,8 @@ fn onReleased(click: *gtk.GestureClick, _: c_int, x: f64, y: f64, pane: *Pane) c
 }
 
 fn onMotion(ctrl: *gtk.EventControllerMotion, x: f64, y: f64, pane: *Pane) callconv(.c) void {
+    if (fromTouchscreen(ctrl.as(gtk.EventController))) return;
+    if (pane.pointer.touch == .select) return;
     const mirror = pane.mirror orelse return;
     const t = &mirror.terminal;
     const st = &pane.pointer;
@@ -249,6 +274,13 @@ fn onMotion(ctrl: *gtk.EventControllerMotion, x: f64, y: f64, pane: *Pane) callc
     if (st.last_cell) |lc| if (lc[0] == cell.x and lc[1] == cell.y) return;
     st.last_cell = .{ cell.x, cell.y };
     sendMouse(pane, "motion", 0, cell, state);
+}
+
+fn copySelection(pane: *Pane) void {
+    const widget = pane.widget.as(gtk.Widget);
+    copyTo(pane, widget.getPrimaryClipboard());
+    if (pane.services.settings) |s| if (s.getBool("terminal.copy_on_select", false))
+        copyTo(pane, widget.getClipboard());
 }
 
 fn drag(pane: *Pane, t: *Terminal, cell: Cell) void {
@@ -304,20 +336,147 @@ fn onAutoscroll(data: ?*anyopaque) callconv(.c) c_int {
 }
 
 // ----------------------------------------------------------------------
+// Touch
+
+fn onTouchBegin(swipe: *gtk.GestureDrag, x: f64, y: f64, pane: *Pane) callconv(.c) void {
+    // GestureDrag also recognizes some touchpad swipes in touch-only mode.
+    if (!fromTouchscreen(swipe.as(gtk.EventController))) {
+        _ = swipe.as(gtk.Gesture).setState(.denied);
+        return;
+    }
+    pane.pointer.touch_start = .{ x, y };
+    pane.pointer.touch = .tap;
+    pane.pointer.touch_dy = 0;
+    pane.pointer.touch_scroll_rest = 0;
+    _ = pane.widget.as(gtk.Widget).grabFocus();
+    pane.focusOnServer();
+}
+
+fn pastTouchThreshold(pane: *Pane, dx: f64, dy: f64) bool {
+    return pane.widget.as(gtk.Widget).dragCheckThreshold(0, 0, @intFromFloat(dx), @intFromFloat(dy)) != 0;
+}
+
+fn onTouchUpdate(swipe: *gtk.GestureDrag, dx: f64, dy: f64, pane: *Pane) callconv(.c) void {
+    const st = &pane.pointer;
+    if (st.touch == .tap) {
+        if (!pastTouchThreshold(pane, dx, dy)) return;
+        if (swipe.as(gtk.Gesture).setState(.claimed) == 0) return;
+        st.touch = .scroll;
+    }
+
+    const start_x, const start_y = st.touch_start;
+    const x = start_x + dx;
+    const y = start_y + dy;
+    switch (st.touch) {
+        .scroll => {
+            const state = swipe.as(gtk.EventController).getCurrentEventState();
+            const delta = st.touch_dy - dy;
+            st.touch_dy = dy;
+            if (delta != 0) _ = scrollAt(pane, x, y, 0, delta, .surface, state, &st.touch_scroll_rest);
+        },
+        .select => {
+            const mirror = pane.mirror orelse return;
+            st.x = x;
+            st.y = y;
+            drag(pane, &mirror.terminal, cellAt(pane, &mirror.terminal, x, y));
+        },
+        else => {},
+    }
+}
+
+fn onTouchEnd(swipe: *gtk.GestureDrag, dx: f64, dy: f64, pane: *Pane) callconv(.c) void {
+    const st = &pane.pointer;
+    const touch = st.touch;
+    st.touch = .idle;
+    const ctrl = swipe.as(gtk.EventController);
+    const event = ctrl.getCurrentEvent();
+    const released = if (event) |e|
+        e.getEventType() == .touch_end and e.getEventSequence() == swipe.as(gtk.GestureSingle).getCurrentSequence()
+    else
+        false;
+    const start_x, const start_y = st.touch_start;
+    const x = start_x + dx;
+    const y = start_y + dy;
+
+    if (touch == .select) {
+        stopAutoscroll(st);
+        if (pane.mirror) |mirror| st.gesture.reset(&mirror.terminal);
+        if (released) copySelection(pane);
+    }
+    if (!released) return;
+
+    switch (touch) {
+        .select, .menu => if (pane.services.context_menu) |cm| cm.func(cm.ctx, pane, x, y),
+        .tap => if (!pastTouchThreshold(pane, dx, dy)) {
+            _ = pane.im.as(gtk.IMContext).activateOsk(event);
+            const mirror = pane.mirror orelse return;
+            const t = &mirror.terminal;
+            const state = ctrl.getCurrentEventState();
+            if (!reporting(t, state) or st.left) return;
+            const cell = cellAt(pane, t, x, y);
+            st.left = true;
+            sendMouse(pane, "press", 1, cell, state);
+            st.left = false;
+            sendMouse(pane, "release", 1, cell, state);
+        },
+        else => {},
+    }
+}
+
+fn onTouchHold(hold: *gtk.GestureLongPress, x: f64, y: f64, pane: *Pane) callconv(.c) void {
+    const st = &pane.pointer;
+    if (st.touch != .tap) return;
+    if (hold.as(gtk.Gesture).setState(.claimed) == 0) return;
+    st.touch = .menu;
+    if (st.selecting) return;
+    const mirror = pane.mirror orelse return;
+    const t = &mirror.terminal;
+    const pin = pinAt(t, cellAt(pane, t, x, y)) orelse return;
+    const scale = pane.widget.scale();
+    const sel = st.gesture.press(t, .{
+        .time = null,
+        .pin = pin,
+        .xpos = x * scale,
+        .ypos = y * scale,
+        .max_distance = 0,
+        .repeat_interval = 0,
+        .word_boundary_codepoints = word_boundaries,
+        .behaviors = &.{ .word, .word, .word },
+    }) catch return;
+    t.screens.active.select(sel) catch {};
+    st.touch = .select;
+    st.x = x;
+    st.y = y;
+    pane.selectionChanged();
+}
+
+// ----------------------------------------------------------------------
 // Wheel
 
 fn onScroll(ctrl: *gtk.EventControllerScroll, dx: f64, dy: f64, pane: *Pane) callconv(.c) c_int {
-    const mirror = pane.mirror orelse return 0;
-    const t = &mirror.terminal;
     const st = &pane.pointer;
     const state = ctrl.as(gtk.EventController).getCurrentEventState();
-    const unit = ctrl.getUnit();
+    return scrollAt(pane, st.x, st.y, dx, dy, ctrl.getUnit(), state, &st.scroll_rest);
+}
+
+fn scrollAt(
+    pane: *Pane,
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    unit: gdk.ScrollUnit,
+    state: gdk.ModifierType,
+    scroll_rest: *f64,
+) c_int {
+    const mirror = pane.mirror orelse return 0;
+    const t = &mirror.terminal;
 
     // In a full-screen program, or one that asked for the mouse, the
     // program scrolls.
     if (reporting(t, state) or t.screens.active_key == .alternate) {
         var mods_buf: [64]u8 = undefined;
-        const cell = cellAt(pane, t, st.x, st.y);
+        const cell = cellAt(pane, t, x, y);
         pane.machine.send("block.event", .{
             .session_id = pane.session_id,
             .block_id = pane.block_id,
@@ -337,9 +496,9 @@ fn onScroll(ctrl: *gtk.EventControllerScroll, dx: f64, dy: f64, pane: *Pane) cal
     const step: f64 = if (pane.services.settings) |s| s.getNumber("terminal.scroll_lines", 3) else 3;
     const lines: f64 = if (unit == .wheel) dy * step else lines: {
         const cell_h: f64 = @as(f64, @floatFromInt(pane.services.fonts.cellSize().height)) / pane.widget.scale();
-        st.scroll_rest += dy;
-        const n = @trunc(st.scroll_rest / cell_h);
-        st.scroll_rest -= n * cell_h;
+        scroll_rest.* += dy;
+        const n = @trunc(scroll_rest.* / cell_h);
+        scroll_rest.* -= n * cell_h;
         break :lines n;
     };
     if (lines == 0) return 1;
