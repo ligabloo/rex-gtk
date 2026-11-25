@@ -132,8 +132,27 @@ pub const Sidebar = struct {
     fn onRebuild(data: ?*anyopaque) callconv(.c) c_int {
         const self: *Sidebar = @ptrCast(@alignCast(data.?));
         self.rebuild_id = 0;
+        // An activity update can arrive between pressing and releasing a
+        // row button. Keep that widget alive until GTK completes the click.
+        if (self.rowButtonPressed()) {
+            self.rebuild_id = glib.timeoutAdd(50, &onRebuild, self);
+            return 0;
+        }
         self.rebuild();
         return 0;
+    }
+
+    fn rowButtonPressed(self: *const Sidebar) bool {
+        var child = self.list.as(gtk.Widget).getFirstChild();
+        while (child) |widget| : (child = widget.getNextSibling()) {
+            const row = gobject.ext.cast(gtk.ListBoxRow, widget) orelse continue;
+            const box = row.getChild() orelse continue;
+            var item = box.getFirstChild();
+            while (item) |w| : (item = w.getNextSibling()) {
+                if (w.getStateFlags().active and gobject.ext.cast(gtk.Button, w) != null) return true;
+            }
+        }
+        return false;
     }
 
     pub fn rebuild(self: *Sidebar) void {
@@ -177,7 +196,7 @@ pub const Sidebar = struct {
                     };
                     const hay = std.fmt.allocPrint(a, "{s} {s} {s}", .{ title, detail, name }) catch continue;
                     _ = std.ascii.lowerString(hay, hay);
-                    self.append(tabRow(title, detail, activity), .{
+                    self.append(self.tabRow(title, detail, activity), .{
                         .kind = .tab,
                         .machine = m,
                         .session_id = sid,
@@ -272,7 +291,7 @@ pub const Sidebar = struct {
         return row;
     }
 
-    fn tabRow(title: []const u8, detail: []const u8, activity: ov.Summary) *gtk.ListBoxRow {
+    fn tabRow(self: *Sidebar, title: []const u8, detail: []const u8, activity: ov.Summary) *gtk.ListBoxRow {
         const row = gtk.ListBoxRow.new();
         row.as(gtk.Widget).addCssClass("tab-row");
         const box = gtk.Box.new(.horizontal, 10);
@@ -306,7 +325,17 @@ pub const Sidebar = struct {
             text.append(d.as(gtk.Widget));
         }
         box.append(text.as(gtk.Widget));
-        if (activityMark(activity.state)) |mark| box.append(mark);
+        const status = gtk.Box.new(.horizontal, 0);
+        status.as(gtk.Widget).addCssClass("tab-activity");
+        if (activityMark(activity.state)) |mark| status.append(mark);
+        box.append(status.as(gtk.Widget));
+        const close = gtk.Button.newFromIconName("window-close-symbolic");
+        close.as(gtk.Widget).addCssClass("flat");
+        close.as(gtk.Widget).addCssClass("tab-close");
+        close.as(gtk.Widget).setValign(.center);
+        close.as(gtk.Widget).setTooltipText("Close Tab");
+        _ = gtk.Button.signals.clicked.connect(close, *Sidebar, &onCloseTab, self, .{});
+        box.append(close.as(gtk.Widget));
         row.setChild(box.as(gtk.Widget));
         return row;
     }
@@ -347,14 +376,29 @@ pub const Sidebar = struct {
         @import("actions.zig").newSessionOn(app, m);
     }
 
+    fn buttonEntry(self: *Sidebar, button: *gtk.Button) ?Entry {
+        const box = button.as(gtk.Widget).getParent() orelse return null;
+        const widget = box.getParent() orelse return null;
+        const row = gobject.ext.cast(gtk.ListBoxRow, widget) orelse return null;
+        const index = std.math.cast(usize, row.getIndex()) orelse return null;
+        if (index >= self.entries.items.len) return null;
+        return self.entries.items[index];
+    }
+
     fn onNewTab(button: *gtk.Button, self: *Sidebar) callconv(.c) void {
-        const box = button.as(gtk.Widget).getParent() orelse return;
-        const widget = box.getParent() orelse return;
-        const row = gobject.ext.cast(gtk.ListBoxRow, widget) orelse return;
-        const index = std.math.cast(usize, row.getIndex()) orelse return;
-        if (index >= self.entries.items.len) return;
-        const entry = self.entries.items[index];
+        const entry = self.buttonEntry(button) orelse return;
         @import("actions.zig").newTabOn(self.app, entry.machine, entry.session_id);
+    }
+
+    fn onCloseTab(button: *gtk.Button, self: *Sidebar) callconv(.c) void {
+        const entry = self.buttonEntry(button) orelse return;
+        const m = entry.machine;
+        if (self.app.view) |view| {
+            if (view.machine == m and std.mem.eql(u8, view.session_id, entry.session_id)) {
+                return view.closeTab(entry.window_id);
+            }
+        }
+        m.overview.closeWindow(entry.session_id, entry.window_id);
     }
 
     fn onRetry(_: *gtk.Button, m: *Machine) callconv(.c) void {

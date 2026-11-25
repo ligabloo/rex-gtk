@@ -331,10 +331,10 @@ pub const SessionView = struct {
         return if (index < self.tabs.items.len) self.tabs.items[index] else null;
     }
 
-    pub fn closeTab(self: *SessionView, tab: *const Tab) void {
+    pub fn closeTab(self: *SessionView, window_id: []const u8) void {
         self.machine.send("session.close_window", .{
             .session_id = self.session_id,
-            .window_id = tab.window_id,
+            .window_id = window_id,
         });
     }
 
@@ -636,7 +636,7 @@ pub const SessionView = struct {
     fn onClosePage(view: *adw.TabView, page: *adw.TabPage, self: *SessionView) callconv(.c) c_int {
         if (self.syncing) return 0; // we're removing it: let it close
         // Leave the tab in place until the server reports the change.
-        if (self.tabForPage(page)) |tab| self.closeTab(tab);
+        if (self.tabForPage(page)) |tab| self.closeTab(tab.window_id);
         view.closePageFinish(page, 0);
         return 1;
     }

@@ -70,6 +70,7 @@ pub const Session = struct {
     /// A view request is in flight, and whether another is needed after.
     fetching: bool = false,
     stale: bool = false,
+    close_revision: ?u64 = null,
 };
 
 pub const BlockInfo = struct {
@@ -227,6 +228,30 @@ pub const Overview = struct {
 
     const ViewReq = struct { ov: *Overview, session_id: []u8 };
 
+    pub fn closeWindow(self: *Overview, session_id: []const u8, window_id: []const u8) void {
+        const req = self.gpa.create(ViewReq) catch return;
+        req.* = .{ .ov = self, .session_id = self.gpa.dupe(u8, session_id) catch {
+            self.gpa.destroy(req);
+            return;
+        } };
+        self.machine.call("session.close_window", .{ .session_id = session_id, .window_id = window_id }, req, &onWindowClosed);
+    }
+
+    fn onWindowClosed(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
+        const req: *ViewReq = @ptrCast(@alignCast(ctx.?));
+        const self = req.ov;
+        defer {
+            self.gpa.free(req.session_id);
+            self.gpa.destroy(req);
+        }
+        const msg = maybe_msg orelse return;
+        defer msg.deinit();
+        const result = api.parse(struct { revision: u64 }, msg) orelse return;
+        const s = self.session(req.session_id) orelse return;
+        s.close_revision = @max(s.close_revision orelse 0, result.revision);
+        self.fetchView(s);
+    }
+
     fn fetchView(self: *Overview, s: *Session) void {
         if (s.fetching) {
             s.stale = true;
@@ -258,10 +283,18 @@ pub const Overview = struct {
         if (view.revision < s.revision) return;
         s.revision = view.revision;
 
+        const windows = view.windows orelse &.{};
+        if (!s.fetching) if (s.close_revision) |revision| {
+            if (view.revision >= revision) {
+                s.close_revision = null;
+                if (windows.len == 0) self.machine.send("session.destroy", .{ .session_id = s.session_id });
+            }
+        };
+
         self.clearWindows(s);
         if (s.active_window_id) |a| self.gpa.free(a);
         s.active_window_id = if (view.active_window_id) |a| self.gpa.dupe(u8, a) catch null else null;
-        for (view.windows orelse &.{}) |w| {
+        for (windows) |w| {
             const id = w.window_id;
             var blocks: std.ArrayList([]u8) = .empty;
             for (w.layers orelse &.{}) |layer| for (layer.blocks orelse &.{}) |b| {

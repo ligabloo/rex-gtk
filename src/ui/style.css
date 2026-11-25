@@ -31,13 +31,19 @@
 }
 
 /* Show New Session and New Tab when hovering their rows. */
-.rex-sidebar .row-create {
+.rex-sidebar .row-create,
+.rex-sidebar .tab-close {
   opacity: 0;
-  transition: opacity 120ms ease;
 }
 .rex-sidebar row:hover .row-create,
-.rex-sidebar .row-create:focus-visible {
+.rex-sidebar .row-create:focus-visible,
+.rex-sidebar row:hover .tab-close,
+.rex-sidebar .tab-close:focus-visible {
   opacity: 1;
+}
+
+.rex-sidebar .tab-activity {
+  min-width: 16px;
 }
 
 /* The tile beside a tab's name. */

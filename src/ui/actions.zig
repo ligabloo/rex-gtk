@@ -178,7 +178,7 @@ pub fn perform(app: *App, name: []const u8, args: std.json.Value) Error!void {
     }
 
     const tab = view.selectedTab() orelse return error.NoTarget;
-    if (eq(u8, name, "client.tab.close")) return view.closeTab(tab);
+    if (eq(u8, name, "client.tab.close")) return view.closeTab(tab.window_id);
     if (eq(u8, name, "client.tab.rename")) return promptRename(app, .tab, tab.label orelse "", "Rename Tab");
 
     // Panes.
