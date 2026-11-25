@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const core = @import("core");
 const data = core.data;
 const ghostty_vt = core.ghostty_vt;
+const glib = @import("glib");
 const mainloop = @import("mainloop.zig");
 
 const log = std.log.scoped(.stream);
@@ -36,6 +37,11 @@ pub const End = struct {
 /// stops reading. Keeps `cat hugefile` from piling up memory.
 const max_queued_bytes = 8 * 1024 * 1024;
 
+/// Output arriving within this long of the last drain is a flood, and is
+/// delivered at idle priority so GTK still gets to redraw. Sparser output,
+/// such as the echo of a key, is delivered ahead of the redraw.
+const busy_window_us = 4 * std.time.us_per_ms;
+
 pub const Stream = struct {
     gpa: Allocator,
     io: std.Io,
@@ -51,6 +57,18 @@ pub const Stream = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     /// Bytes posted to the main thread and not yet delivered.
     queued: std.atomic.Value(usize) = .init(0),
+
+    /// Stream bytes read and not yet delivered, and whether a `drain` is
+    /// posted for them. Guarded by `pending_mutex`.
+    pending: std.ArrayList(u8) = .empty,
+    drain_posted: bool = false,
+    pending_mutex: std.Io.Mutex = .init,
+    /// Main thread: the bytes being delivered, swapped with `pending`.
+    draining: std.ArrayList(u8) = .empty,
+    /// Set while the main thread delivers bytes, and when it last finished
+    /// (GLib monotonic time). The reader picks a priority from them.
+    feeding: std.atomic.Value(bool) = .init(false),
+    last_drain_us: std.atomic.Value(i64) = .init(0),
 
     pub fn create(gpa: Allocator, io: std.Io, socket_path: []const u8, ticket: []const u8, sink: Sink) !*Stream {
         const self = try gpa.create(Stream);
@@ -81,6 +99,8 @@ pub const Stream = struct {
 
     fn free(self: *Stream) void {
         if (self.conn.load(.acquire)) |dc| dc.destroy();
+        self.pending.deinit(self.gpa);
+        self.draining.deinit(self.gpa);
         self.gpa.free(self.ticket);
         self.gpa.destroy(self);
     }
@@ -129,21 +149,27 @@ pub const Stream = struct {
     }
 
     const Ready = struct { stream: *Stream, decoded: *ghostty_vt.snapshot.Decoded, nonce: u64 };
-    const Bytes = struct { stream: *Stream, bytes: []u8 };
     const Ended = struct { stream: *Stream, end: End };
 
     fn postReady(self: *Stream, decoded: *ghostty_vt.snapshot.Decoded, nonce: u64) void {
         const m = self.gpa.create(Ready) catch return;
         m.* = .{ .stream = self, .decoded = decoded, .nonce = nonce };
-        mainloop.post(Ready, m, deliverReady);
+        // Same priority as the first `drain`, so it can't overtake this.
+        mainloop.postWithPriority(Ready, m, deliverReady, .default);
     }
 
+    /// Queue bytes for the main thread. One `drain` delivers everything
+    /// queued since the last, so a burst costs one callback.
     fn postBytes(self: *Stream, bytes: []const u8) !void {
-        const m = try self.gpa.create(Bytes);
-        errdefer self.gpa.destroy(m);
-        m.* = .{ .stream = self, .bytes = try self.gpa.dupe(u8, bytes) };
+        self.pending_mutex.lockUncancelable(self.io);
+        defer self.pending_mutex.unlock(self.io);
+        try self.pending.appendSlice(self.gpa, bytes);
         _ = self.queued.fetchAdd(bytes.len, .release);
-        mainloop.post(Bytes, m, deliverBytes);
+        if (self.drain_posted) return;
+        self.drain_posted = true;
+        const busy = self.feeding.load(.acquire) or
+            glib.getMonotonicTime() - self.last_drain_us.load(.acquire) < busy_window_us;
+        mainloop.postWithPriority(Stream, self, drain, if (busy) .idle else .default);
     }
 
     fn postEnded(self: *Stream, end: End) void {
@@ -165,14 +191,21 @@ pub const Stream = struct {
         self.sink.ready(self.sink.ctx, m.decoded, m.nonce);
     }
 
-    fn deliverBytes(m: *Bytes) void {
-        const self = m.stream;
-        defer {
-            _ = self.queued.fetchSub(m.bytes.len, .release);
-            self.gpa.free(m.bytes);
-            self.gpa.destroy(m);
+    fn drain(self: *Stream) void {
+        self.feeding.store(true, .release);
+        {
+            self.pending_mutex.lockUncancelable(self.io);
+            defer self.pending_mutex.unlock(self.io);
+            std.mem.swap(std.ArrayList(u8), &self.pending, &self.draining);
+            self.drain_posted = false;
         }
-        if (!self.closed) self.sink.bytes(self.sink.ctx, m.bytes);
+        defer {
+            _ = self.queued.fetchSub(self.draining.items.len, .release);
+            self.draining.clearRetainingCapacity();
+            self.last_drain_us.store(glib.getMonotonicTime(), .release);
+            self.feeding.store(false, .release);
+        }
+        if (!self.closed and self.draining.items.len > 0) self.sink.bytes(self.sink.ctx, self.draining.items);
     }
 
     fn deliverEnded(m: *Ended) void {

@@ -604,7 +604,10 @@ pub const Renderer = struct {
             });
         }
         try gl.errors.getError();
-        gl.finish();
+        // Submit the work without waiting for it. The DMA-BUF's implicit
+        // fence makes GTK wait for the GPU, not this thread. (glFinish here
+        // stalled the main thread, and with it input, every frame.)
+        gl.flush();
         return target;
     }
 

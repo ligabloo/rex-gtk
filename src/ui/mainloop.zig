@@ -6,12 +6,27 @@
 
 const glib = @import("glib");
 
-/// Run `handler(data)` on the main thread. Safe to call from any thread.
+pub const Priority = enum(c_int) {
+    /// Runs when nothing more urgent is pending, after GTK's redraws.
+    idle = glib.PRIORITY_DEFAULT_IDLE,
+    /// Runs alongside input events, ahead of GTK's redraws. For latency-
+    /// sensitive work that can't flood the loop.
+    default = glib.PRIORITY_DEFAULT,
+};
+
+/// Run `handler(data)` on the main thread at idle priority. Safe to call
+/// from any thread.
 pub fn post(comptime T: type, data: *T, comptime handler: fn (*T) void) void {
+    postWithPriority(T, data, handler, .idle);
+}
+
+/// Run `handler(data)` on the main thread. Safe to call from any thread.
+pub fn postWithPriority(comptime T: type, data: *T, comptime handler: fn (*T) void, priority: Priority) void {
     const Trampoline = struct {
-        fn run(ptr: ?*anyopaque) callconv(.c) void {
+        fn run(ptr: ?*anyopaque) callconv(.c) c_int {
             handler(@ptrCast(@alignCast(ptr.?)));
+            return 0; // G_SOURCE_REMOVE
         }
     };
-    _ = glib.idleAddOnce(&Trampoline.run, data);
+    _ = glib.idleAddFull(@intFromEnum(priority), &Trampoline.run, data, null);
 }
