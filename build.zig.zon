@@ -1,6 +1,6 @@
 .{
     .name = .rex_gtk,
-    .version = "0.0.1",
+    .version = "0.2.0",
     .dependencies = .{
         .ghostty = .{
             .url = "https://github.com/ghostty-org/ghostty/archive/74d1983f27eb004ef442c8353bd703eba19c93b6.tar.gz",

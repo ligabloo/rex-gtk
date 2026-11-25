@@ -26,6 +26,12 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.0" date="2026-11-25">
+      <description>
+        <p>Browse sessions on remote Rex servers over TCP, TLS, and SSH, and pair devices over Tailscale.</p>
+        <p>Add tabs from session headers. Closing the last tab ends the session.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-24">
       <description>
         <p>First version: sessions, tabs, splits, mouse and clipboard, Rex key bindings and remote control.</p>

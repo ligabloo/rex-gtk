@@ -24,7 +24,7 @@ pub const ClientInfo = struct {
     kind: []const u8 = "app",
     platform: []const u8 = "linux",
     name: []const u8 = "rex-gtk",
-    version: []const u8 = "0.0.1",
+    version: []const u8 = "0.2.0",
     label: ?[]const u8 = null,
 };
 
