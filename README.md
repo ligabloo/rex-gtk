@@ -117,3 +117,8 @@ was built with. To find it and update the pin:
 
 Current pin: Ghostty `74d1983f27eb004ef442c8353bd703eba19c93b6`
 (go-libghostty `5bbe1d0d0990`, Rex server `0.1.0-preview.23`).
+
+## License
+
+MIT (see `LICENSE`). rex-gtk includes code derived from [Ghostty](https://github.com/ghostty-org/ghostty),
+also under the MIT license; its notice is installed as `share/licenses/rex-gtk/LICENSE.ghostty`.

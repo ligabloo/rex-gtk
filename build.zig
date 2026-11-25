@@ -86,6 +86,7 @@ pub fn build(b: *std.Build) void {
     );
     // rex-gtk includes code derived from Ghostty, under Ghostty's MIT license.
     b.getInstallStep().dependOn(&b.addInstallFile(ghostty.path("LICENSE"), "share/licenses/rex-gtk/LICENSE.ghostty").step);
+    b.installFile("LICENSE", "share/licenses/rex-gtk/LICENSE");
 
     // The headless tools are for development; packages can leave them out.
     const install_tools = b.option(bool, "tools", "Install rexcat, rexshot and fontcheck (default: true)") orelse true;
