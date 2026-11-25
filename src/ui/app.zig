@@ -187,6 +187,7 @@ pub const App = struct {
         window.as(gtk.Widget).addController(keys.as(gtk.EventController));
 
         // Sidebar: every machine's sessions and their tabs.
+        self.loadIcons();
         self.sidebar.init(self);
         self.sidebar_ready = true;
         self.loadCss();
@@ -1234,6 +1235,18 @@ pub const App = struct {
         provider.loadFromString(@embedFile("style.css"));
         const display = gdk.Display.getDefault() orelse return;
         gtk.StyleContext.addProviderForDisplay(display, provider.as(gtk.StyleProvider), gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+
+    /// Register the icons the system theme may not ship (src/ui/icons,
+    /// compiled to a bundle with glib-compile-resources), so `icon-name`
+    /// lookups find them. Runs before any widget is built.
+    fn loadIcons(_: *App) void {
+        const bundle = @embedFile("icons/rex-icons.gresource");
+        const bytes = glib.Bytes.newStatic(bundle.ptr, bundle.len);
+        const resource = gio.Resource.newFromData(bytes, null) orelse return;
+        gio.resourcesRegister(resource);
+        const display = gdk.Display.getDefault() orelse return;
+        gtk.IconTheme.getForDisplay(display).addResourcePath("/org/rex-gtk/icons");
     }
 
     /// The shown session is gone: show another, or say there are none.

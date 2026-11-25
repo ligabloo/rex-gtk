@@ -9,13 +9,34 @@
   margin-top: 0;
 }
 .rex-sidebar row.session-row {
-  min-height: 22px;
+  min-height: 26px;
   padding-top: 4px;
   padding-bottom: 0;
 }
 .rex-sidebar row.tab-row {
   padding-top: 5px;
   padding-bottom: 5px;
+}
+
+/* The caret that collapses machines and sessions, shown on hover
+   (or while collapsed, so the state is never a surprise). */
+.rex-sidebar .expander {
+  -gtk-icon-size: 12px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.rex-sidebar row:hover .expander,
+.rex-sidebar row.collapsed .expander {
+  opacity: 1;
+}
+
+/* The machine row's New Session stays out of the way until hover. */
+.rex-sidebar .new-session {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.rex-sidebar row:hover .new-session {
+  opacity: 1;
 }
 
 /* The tile beside a tab's name. */
@@ -40,6 +61,13 @@
 .activity-dot {
   font-size: 10px;
   margin-right: 4px;
+}
+
+/* The sidebar toggle is a plain icon whether the sidebar is shown or not. */
+.sidebar-toggle:checked {
+  background: none;
+  box-shadow: none;
+  color: inherit;
 }
 
 /* Preferences › Themes. */

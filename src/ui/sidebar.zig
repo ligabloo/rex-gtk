@@ -39,6 +39,10 @@ pub const Sidebar = struct {
     filter_toggle: *gtk.ToggleButton,
     filter: *gtk.SearchEntry,
     entries: std.ArrayList(Entry) = .empty,
+    /// Machines and sessions the user collapsed. Sessions are keyed by
+    /// session id, owned.
+    collapsed_machines: std.AutoHashMapUnmanaged(*Machine, void) = .empty,
+    collapsed_sessions: std.StringHashMapUnmanaged(void) = .empty,
     arena: std.heap.ArenaAllocator,
     rebuild_id: c_uint = 0,
     syncing: bool = false,
@@ -54,7 +58,7 @@ pub const Sidebar = struct {
         new_tab.as(gtk.Actionable).setActionName("app.rex");
         new_tab.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.tab.new"));
         header.packEnd(new_tab.as(gtk.Widget));
-        const palette = gtk.Button.newFromIconName("system-search-symbolic");
+        const palette = gtk.Button.newFromIconName("modifier-key-symbolic");
         palette.as(gtk.Widget).setTooltipText("Command Palette");
         palette.as(gtk.Actionable).setActionName("app.rex");
         palette.as(gtk.Actionable).setActionTargetValue(glib.Variant.newString("client.palette.toggle"));
@@ -70,10 +74,12 @@ pub const Sidebar = struct {
 
         // Bottom: a filter that opens inline, and Add Machine.
         const filter_toggle = gtk.ToggleButton.new();
-        filter_toggle.as(gtk.Button).setIconName("edit-find-symbolic");
+        filter_toggle.as(gtk.Button).setIconName("filter-symbolic");
         filter_toggle.as(gtk.Widget).setTooltipText("Filter Tabs");
         filter_toggle.as(gtk.Widget).addCssClass("flat");
         const filter = gtk.SearchEntry.new();
+        if (gobject.ext.cast(gtk.Entry, filter.as(gobject.Object))) |entry|
+            entry.setIconFromIconName(.primary, null);
         filter.as(gtk.Widget).setHexpand(1);
         filter.as(gtk.Widget).setVisible(0);
         filter.setPlaceholderText("Filter");
@@ -115,6 +121,10 @@ pub const Sidebar = struct {
     pub fn deinit(self: *Sidebar) void {
         if (self.rebuild_id != 0) _ = glib.Source.remove(self.rebuild_id);
         self.rebuild_id = 0;
+        var it = self.collapsed_sessions.iterator();
+        while (it.next()) |kv| self.gpa.free(kv.key_ptr.*);
+        self.collapsed_sessions.deinit(self.gpa);
+        self.collapsed_machines.deinit(self.gpa);
         self.entries.deinit(self.gpa);
         self.arena.deinit();
     }
@@ -148,10 +158,11 @@ pub const Sidebar = struct {
                 .haystack = std.ascii.allocLowerString(a, m.title()) catch "",
             });
             if (m.state != .connected) continue;
+            const machine_collapsed = self.collapsed_machines.contains(m);
             for (m.sessions.items) |s| {
                 const sid = a.dupe(u8, s.session_id) catch continue;
                 const name = if (s.label.len > 0) s.label else shortId(s.session_id);
-                self.append(sessionRow(name), .{
+                self.append(sessionRow(name, machine_collapsed or self.collapsed_sessions.contains(sid)), .{
                     .kind = .session,
                     .machine = m,
                     .session_id = sid,
@@ -198,10 +209,11 @@ pub const Sidebar = struct {
     // Rows
 
     fn machineRow(self: *Sidebar, m: *Machine) *gtk.ListBoxRow {
+        const collapsed = self.collapsed_machines.contains(m);
         const row = gtk.ListBoxRow.new();
         row.setSelectable(0);
-        row.setActivatable(0);
         row.as(gtk.Widget).addCssClass("machine-row");
+        if (collapsed) row.as(gtk.Widget).addCssClass("collapsed");
         const box = gtk.Box.new(.horizontal, 8);
         box.append(gtk.Image.newFromIconName(if (m.is_local) "computer-symbolic" else "network-server-symbolic").as(gtk.Widget));
         var buf: [128]u8 = undefined;
@@ -215,6 +227,7 @@ pub const Sidebar = struct {
             .connected => {
                 const b = gtk.Button.newFromIconName("window-new-symbolic");
                 b.as(gtk.Widget).addCssClass("flat");
+                b.as(gtk.Widget).addCssClass("new-session");
                 b.as(gtk.Widget).setTooltipText("New Session");
                 _ = gtk.Button.signals.clicked.connect(b, *Machine, &onNewSession, m, .{});
                 box.append(b.as(gtk.Widget));
@@ -230,23 +243,32 @@ pub const Sidebar = struct {
                 box.append(b.as(gtk.Widget));
             },
         }
+        const expander = gtk.Image.newFromIconName(if (collapsed) "pan-end-symbolic" else "pan-down-symbolic");
+        expander.as(gtk.Widget).addCssClass("expander");
+        box.append(expander.as(gtk.Widget));
         row.setChild(box.as(gtk.Widget));
-        _ = self;
         return row;
     }
 
-    fn sessionRow(name: []const u8) *gtk.ListBoxRow {
+    fn sessionRow(name: []const u8, collapsed: bool) *gtk.ListBoxRow {
         const row = gtk.ListBoxRow.new();
         row.setSelectable(0);
         row.as(gtk.Widget).addCssClass("session-row");
+        if (collapsed) row.as(gtk.Widget).addCssClass("collapsed");
+        const box = gtk.Box.new(.horizontal, 8);
         var buf: [256]u8 = undefined;
         const label = gtk.Label.new(std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch "Session");
         label.setXalign(0);
         label.setEllipsize(.end);
-        label.as(gtk.Widget).addCssClass("caption-heading");
+        label.as(gtk.Widget).setHexpand(1);
+        label.as(gtk.Widget).addCssClass("heading");
         label.as(gtk.Widget).addCssClass("dim-label");
-        row.setChild(label.as(gtk.Widget));
-        row.as(gtk.Widget).setTooltipText("Show this session");
+        box.append(label.as(gtk.Widget));
+        const expander = gtk.Image.newFromIconName(if (collapsed) "pan-end-symbolic" else "pan-down-symbolic");
+        expander.as(gtk.Widget).addCssClass("expander");
+        box.append(expander.as(gtk.Widget));
+        row.setChild(box.as(gtk.Widget));
+        row.as(gtk.Widget).setTooltipText("Show or hide this session's tabs");
         return row;
     }
 
@@ -342,9 +364,58 @@ pub const Sidebar = struct {
         if (i >= self.entries.items.len) return;
         const e = self.entries.items[i];
         switch (e.kind) {
-            .machine => {},
-            .session => self.app.switchSession(e.machine, e.session_id),
+            .machine => {
+                self.toggleMachine(e.machine);
+                self.list.invalidateFilter();
+            },
+            .session => {
+                self.toggleSession(e.session_id);
+                self.list.invalidateFilter();
+            },
             .tab => self.app.showTab(e.machine, e.session_id, e.window_id),
+        }
+    }
+
+    fn toggleMachine(self: *Sidebar, m: *Machine) void {
+        if (self.collapsed_machines.contains(m)) {
+            _ = self.collapsed_machines.remove(m);
+        } else {
+            self.collapsed_machines.put(self.gpa, m, {}) catch return;
+        }
+        self.syncExpander(m, null);
+    }
+
+    fn toggleSession(self: *Sidebar, session_id: []const u8) void {
+        if (self.collapsed_sessions.fetchRemove(session_id)) |kv| {
+            self.gpa.free(kv.key);
+        } else {
+            const key = self.gpa.dupe(u8, session_id) catch return;
+            self.collapsed_sessions.put(self.gpa, key, {}) catch self.gpa.free(key);
+        }
+        self.syncExpander(null, session_id);
+    }
+
+    /// Point the expander of the machine or session row for `id` at its
+    /// collapse state; the other argument is null.
+    fn syncExpander(self: *Sidebar, m: ?*Machine, session_id: ?[]const u8) void {
+        for (self.entries.items, 0..) |e, i| {
+            const match = switch (e.kind) {
+                .machine => m != null and e.machine == m.?,
+                .session => session_id != null and std.mem.eql(u8, e.session_id, session_id.?),
+                .tab => false,
+            };
+            if (!match) continue;
+            const row = self.list.getRowAtIndex(@intCast(i)) orelse continue;
+            const collapsed = switch (e.kind) {
+                .machine => self.collapsed_machines.contains(e.machine),
+                .session => self.collapsed_sessions.contains(e.session_id),
+                .tab => false,
+            };
+            if (collapsed) row.as(gtk.Widget).addCssClass("collapsed") else row.as(gtk.Widget).removeCssClass("collapsed");
+            const child = row.getChild() orelse continue;
+            const expander = child.getLastChild() orelse continue;
+            if (gobject.ext.cast(gtk.Image, expander)) |img|
+                img.setFromIconName(if (collapsed) "pan-end-symbolic" else "pan-down-symbolic");
         }
     }
 
@@ -403,14 +474,22 @@ pub const Sidebar = struct {
     }
 
     /// A tab shows if it matches; a heading if anything under it does.
+    /// With no query, collapsed machines and sessions hide their children.
     fn filterRow(row: *gtk.ListBoxRow, data: ?*anyopaque) callconv(.c) c_int {
         const self: *Sidebar = @ptrCast(@alignCast(data.?));
         var buf: [256]u8 = undefined;
         const q = self.query(&buf);
-        if (q.len == 0) return 1;
         const i: usize = @intCast(row.getIndex());
         if (i >= self.entries.items.len) return 1;
         const e = self.entries.items[i];
+        if (q.len == 0) {
+            return switch (e.kind) {
+                .machine => 1,
+                .session => @intFromBool(!self.collapsed_machines.contains(e.machine)),
+                .tab => @intFromBool(!self.collapsed_machines.contains(e.machine) and
+                    !self.collapsed_sessions.contains(e.session_id)),
+            };
+        }
         switch (e.kind) {
             .tab => return @intFromBool(std.mem.indexOf(u8, e.haystack, q) != null),
             .session, .machine => {

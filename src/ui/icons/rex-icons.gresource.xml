@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/rex-gtk/icons">
+    <file alias="scalable/actions/filter-symbolic.svg">filter-symbolic.svg</file>
+    <file alias="scalable/actions/modifier-key-symbolic.svg">modifier-key-symbolic.svg</file>
+  </gresource>
+</gresources>
