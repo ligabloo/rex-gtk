@@ -17,8 +17,8 @@ const tv = @import("terminal_view.zig");
 const api = @import("api.zig");
 const SessionView = @import("session_view.zig").SessionView;
 const actions = @import("actions.zig");
-const keymap = @import("keymap.zig");
-const input = @import("input.zig");
+const Keys = @import("keys.zig").Keys;
+const prompts = @import("prompts.zig");
 
 const log = std.log.scoped(.app);
 
@@ -57,8 +57,10 @@ pub const App = struct {
 
     /// The terminal font size in points; starts at `options.font_size`.
     font_size: f32 = 11,
-    /// The key bindings in effect, top of each key's stack first.
-    bindings: []const keymap.Binding = &keymap.defaults,
+    /// Key bindings, sequences and modes.
+    keys: Keys = undefined,
+    /// Prompts from configuration file actions (rex.ui) being shown.
+    prompts: prompts.Prompts = undefined,
 
     services: ?tv.Services = null,
     /// The sessions in the sidebar, in the server's order.
@@ -78,6 +80,8 @@ pub const App = struct {
             .adw_app = adw.Application.new(app_id, .{ .non_unique = true }),
             .font_size = options.font_size,
         };
+        self.keys = .init(gpa, self);
+        self.prompts = .init(gpa, self);
         _ = gio.Application.signals.activate.connect(self.adw_app, *App, &onActivate, self, .{});
         _ = gio.Application.signals.shutdown.connect(self.adw_app, *App, &onShutdown, self, .{});
         return self;
@@ -89,6 +93,8 @@ pub const App = struct {
     }
 
     pub fn destroy(self: *App) void {
+        self.keys.deinit();
+        self.prompts.deinit();
         self.adw_app.unref();
         self.gpa.destroy(self);
     }
@@ -230,29 +236,12 @@ pub const App = struct {
     /// was bound to an action, which then runs instead of typing.
     fn onShortcut(ctx: *anyopaque, pane: *tv.Pane, keyval: u32, keycode: u32, state: gdk.ModifierType, event: *gdk.KeyEvent, repeat: bool) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
-        const display = pane.widgetPtr().getDisplay();
-        const press: keymap.Press = .{
-            .physical = input.keyName(keycode),
-            .mods = .{ .shift = state.shift_mask, .ctrl = state.control_mask, .alt = state.alt_mask, .super = state.super_mask },
-            .unshifted = @intCast(input.unshiftedCodepoint(display, keycode, event.getLayout())),
-            .shifted = @intCast(gdk.keyvalToUnicode(keyval)),
-        };
-        for (self.bindings) |b| {
-            if (b.keys.len != 1 or b.mode != null) continue;
-            const key = keymap.Key.parse(b.keys[0]) orelse continue;
-            if (!key.matches(press)) continue;
-            const action = actions.find(b.action) orelse continue;
-            if (repeat and !action.repeats) return true;
-            var arena: std.heap.ArenaAllocator = .init(self.gpa);
-            defer arena.deinit();
-            const args: std.json.Value = if (b.args) |a|
-                std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), a, .{}) catch .null
-            else
-                .null;
-            actions.run(self, action.name, args);
-            return true;
-        }
-        return false;
+        return self.keys.handle(pane, keyval, keycode, state, event, repeat);
+    }
+
+    /// A key sequence or mode started or ended: show it in the title.
+    pub fn keyStateChanged(self: *App) void {
+        self.updateTitle();
     }
 
     /// Debugging aid (--screenshot): render the window to a PNG.
@@ -299,8 +288,19 @@ pub const App = struct {
     }
 
     fn updateTitle(self: *App) void {
+        if (self.window_title == null) return;
         const view = self.view orelse return self.setTitle("Rex", "");
-        self.setTitle(if (view.label.len > 0) view.label else "Rex", view.activeTitle() orelse "");
+        var buf: [256]u8 = undefined;
+        const subtitle: []const u8 = if (self.keys.pendingPrefix().len > 0) sub: {
+            var w: std.Io.Writer = .fixed(&buf);
+            for (self.keys.pendingPrefix()) |k| w.print("{s} ", .{k}) catch {};
+            w.writeAll("…") catch {};
+            break :sub w.buffered();
+        } else if (self.keys.modeName()) |m|
+            std.fmt.bufPrint(&buf, "{s} mode", .{m}) catch m
+        else
+            view.activeTitle() orelse "";
+        self.setTitle(if (view.label.len > 0) view.label else "Rex", subtitle);
     }
 
     fn setTitle(self: *App, title: []const u8, subtitle: []const u8) void {
@@ -366,6 +366,8 @@ pub const App = struct {
             self,
             .{ .detail = "dark" },
         );
+
+        self.keys.fetch();
 
         // List the sessions, pick the one to show, then attach to it.
         client.call("session.list", null, self, &onFirstSessionList);
@@ -596,7 +598,17 @@ pub const App = struct {
         defer msg.deinit();
         const ev = msg.kind.event;
 
-        if (std.mem.eql(u8, ev.name, "session_created") or std.mem.eql(u8, ev.name, "session_moved")) {
+        if (std.mem.eql(u8, ev.name, "keymap_changed")) {
+            const p = api.parseValue(struct { hash: []const u8 = "" }, msg, ev.payload) orelse return;
+            self.keys.changed(p.hash);
+        } else if (std.mem.eql(u8, ev.name, "client_perform_requested")) {
+            self.performRequested(msg, ev.payload);
+        } else if (std.mem.eql(u8, ev.name, "client_prompt_requested")) {
+            self.prompts.show(msg, ev.payload);
+        } else if (std.mem.eql(u8, ev.name, "client_prompt_ended")) {
+            const p = api.parseValue(struct { call_id: []const u8 }, msg, ev.payload) orelse return;
+            self.prompts.end(p.call_id);
+        } else if (std.mem.eql(u8, ev.name, "session_created") or std.mem.eql(u8, ev.name, "session_moved")) {
             self.refreshSessions();
         } else if (std.mem.eql(u8, ev.name, "session_destroyed")) {
             const p = api.parseValue(struct { session_id: []const u8 }, msg, ev.payload) orelse return;
@@ -609,6 +621,30 @@ pub const App = struct {
             if (!std.mem.eql(u8, se.session_id, view.session_id)) return;
             view.handleEvent(msg, se.event.type, se.event.payload);
         }
+    }
+
+    /// Another client asked us to perform one of our actions, such as
+    /// `rex -C linux do pane.split.right`.
+    fn performRequested(self: *App, msg: Incoming, payload: std.json.Value) void {
+        const req = api.parseValue(struct {
+            call_id: []const u8,
+            action: []const u8,
+            args: std.json.Value = .null,
+        }, msg, payload) orelse return;
+        const Err = struct { code: []const u8, message: []const u8 };
+        if (std.mem.startsWith(u8, req.action, "client.mode.")) {
+            self.keys.perform(req.action, req.args, "api");
+            return self.rex().send("client.reply", .{ .call_id = req.call_id, .result = std.json.Value.null });
+        }
+        actions.perform(self, req.action, req.args) catch |err| {
+            const e: Err = switch (err) {
+                error.NotSupported => .{ .code = "not_supported", .message = "rex-gtk has no such action" },
+                error.BadArgs => .{ .code = "refused", .message = "missing or wrong arguments" },
+                error.NoTarget => .{ .code = "refused", .message = "nothing to act on" },
+            };
+            return self.rex().send("client.reply", .{ .call_id = req.call_id, .@"error" = e });
+        };
+        self.rex().send("client.reply", .{ .call_id = req.call_id, .result = std.json.Value.null });
     }
 
     fn onDisconnected(ctx: ?*anyopaque) void {

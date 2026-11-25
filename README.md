@@ -22,7 +22,7 @@ zig build test                                 # unit tests (no display needed)
 
 Options: `--session ID|LABEL` picks the session to show (otherwise the server picks one),
 `--font`/`--font-size` set the terminal font, `--label` names this client for
-`rex -C LABEL …`. For debugging, `--dump-frame PATH` writes every terminal frame to a PNG and
+`rex -C LABEL …` (default: the machine's hostname). For debugging, `--dump-frame PATH` writes every terminal frame to a PNG and
 `--screenshot PATH` saves the whole window to a PNG every second.
 
 The window shows the server's sessions in a sidebar (toggle it with the button at the top left)
@@ -34,6 +34,28 @@ the primary selection, and middle-click pastes it. Ctrl+Shift+C and Ctrl+Shift+V
 with the clipboard, and Ctrl+click opens a URL. The wheel scrolls back through the terminal's
 history; typing returns to the bottom. When a program asks for the mouse (htop, vim with
 `mouse=a`) events go to it instead; hold Shift to select text anyway.
+
+## Shortcuts and remote control
+
+Actions use Rex.app's names, so bindings in `~/.config/rex/init.lua` work here too, and
+`rex -C LABEL actions` lists them. The server merges the built-in shortcuts with your
+configuration file; key sequences (such as `ctrl+b` then `%`), modes and keys bound to Lua
+functions all work. Built-in shortcuts:
+
+| Keys | Action |
+| --- | --- |
+| Ctrl+Shift+T / Ctrl+Shift+N | New tab / new session |
+| Ctrl+PageDown / Ctrl+PageUp, Ctrl+Tab | Next / previous tab |
+| Ctrl+Shift+PageDown / PageUp | Move tab |
+| Alt+1…9 | Go to tab |
+| Ctrl+Shift+O / Ctrl+Shift+E | Split right / down |
+| Ctrl+Alt+arrows, Ctrl+Shift+] / [ | Focus pane |
+| Ctrl+Shift+Enter / Ctrl+Shift+W | Zoom / close pane |
+| Ctrl+Shift+C / V / A | Copy / paste / select all |
+| Shift+PageUp / PageDown | Scroll |
+| Ctrl+Alt+PageDown / PageUp | Next / previous session |
+| Ctrl+Shift+S, F11 | Sidebar, full screen |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Font size |
 
 ## Tools
 

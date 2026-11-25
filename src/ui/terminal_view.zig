@@ -88,6 +88,8 @@ pub const Pane = struct {
     title: ?[]u8 = null,
     /// The working directory the shell reported, if any.
     pwd: ?[]u8 = null,
+    /// Keys of a sequence to send with the next key (see `setKeyPrefix`).
+    key_prefix: std.ArrayList([]u8) = .empty,
     /// Called when the title changes.
     on_title: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, pane: *Pane) void } = null,
 
@@ -176,6 +178,8 @@ pub const Pane = struct {
         self.pressed.deinit(gpa);
         if (self.title) |t| gpa.free(t);
         if (self.pwd) |d| gpa.free(d);
+        self.clearKeyPrefix();
+        self.key_prefix.deinit(gpa);
         gpa.free(self.session_id);
         gpa.free(self.block_id);
         gpa.destroy(self);
@@ -247,6 +251,21 @@ pub const Pane = struct {
         }
         if (self.pwd) |old| gpa.free(old);
         self.pwd = gpa.realloc(copy, n) catch copy[0..n];
+    }
+
+    /// Send these keys as the `prefix` of the next key: it ends a sequence
+    /// bound to a Lua function.
+    pub fn setKeyPrefix(self: *Pane, keys: []const []const u8) void {
+        self.clearKeyPrefix();
+        for (keys) |k| {
+            const copy = self.services.gpa.dupe(u8, k) catch return;
+            self.key_prefix.append(self.services.gpa, copy) catch self.services.gpa.free(copy);
+        }
+    }
+
+    fn clearKeyPrefix(self: *Pane) void {
+        for (self.key_prefix.items) |k| self.services.gpa.free(k);
+        self.key_prefix.clearRetainingCapacity();
     }
 
     pub fn exitCode(self: *const Pane) ?i64 {
@@ -589,7 +608,9 @@ pub const Pane = struct {
                 .composing = false,
                 .action = action,
             },
+            .prefix = if (press and self.key_prefix.items.len > 0) self.key_prefix.items else null,
         });
+        if (press) self.clearKeyPrefix();
 
         // Typing shows the cursor right away, and returns to the bottom.
         self.restartBlink();

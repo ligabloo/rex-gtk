@@ -40,6 +40,11 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
+    // Name this client after the machine unless told otherwise, so
+    // `rex -C <hostname> do …` reaches it.
+    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    if (options.label == null) options.label = std.posix.gethostname(&host_buf) catch null;
+
     const socket_path = try core.control.defaultSocketPath(gpa, init.environ_map);
     defer gpa.free(socket_path);
 
