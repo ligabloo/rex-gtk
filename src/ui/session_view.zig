@@ -16,6 +16,7 @@ const core = @import("core");
 const tv = @import("terminal_view.zig");
 const api = @import("api.zig");
 const Incoming = @import("client.zig").Incoming;
+const Machine = @import("machine.zig").Machine;
 const LayoutWidget = @import("layout_view.zig").LayoutWidget;
 const Placement = @import("layout_view.zig").Placement;
 const Divider = @import("layout_view.zig").Divider;
@@ -62,6 +63,8 @@ pub const Tab = struct {
 pub const SessionView = struct {
     gpa: Allocator,
     services: *tv.Services,
+    /// The server the session lives on.
+    machine: *Machine,
     session_id: []u8,
     label: []u8,
     listener: Listener,
@@ -89,7 +92,7 @@ pub const SessionView = struct {
 
     handlers: [3]c_ulong = .{ 0, 0, 0 },
 
-    pub fn create(gpa: Allocator, services: *tv.Services, session_id: []const u8, listener: Listener) !*SessionView {
+    pub fn create(gpa: Allocator, services: *tv.Services, machine: *Machine, session_id: []const u8, listener: Listener) !*SessionView {
         const self = try gpa.create(SessionView);
         errdefer gpa.destroy(self);
         const tab_view = adw.TabView.new();
@@ -97,6 +100,7 @@ pub const SessionView = struct {
         self.* = .{
             .gpa = gpa,
             .services = services,
+            .machine = machine,
             .session_id = try gpa.dupe(u8, session_id),
             .label = try gpa.dupe(u8, ""),
             .listener = listener,
@@ -138,7 +142,7 @@ pub const SessionView = struct {
 
     fn call(self: *SessionView, method: []const u8, payload: anytype, callback: @import("client.zig").ResponseFn) void {
         self.outstanding += 1;
-        self.services.client.call(method, payload, self, callback);
+        self.machine.call(method, payload, self, callback);
     }
 
     // ------------------------------------------------------------------
@@ -153,7 +157,7 @@ pub const SessionView = struct {
         if (view.label) |l| self.setLabel(l);
 
         const windows = view.windows orelse &.{};
-        const me = self.services.client.clientId();
+        const me = self.machine.clientId();
 
         // Blocks: keep the ones still in a window, add new ones, drop the rest.
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -238,7 +242,7 @@ pub const SessionView = struct {
             return block;
         }
 
-        const pane = Pane.create(self.services, self.session_id, b.block_id) catch |err| {
+        const pane = Pane.create(self.services, self.machine, self.session_id, b.block_id) catch |err| {
             log.err("creating a pane for {s} failed: {}", .{ b.block_id, err });
             block.placeholder = placeholder("Can't show this terminal");
             return block;
@@ -285,7 +289,7 @@ pub const SessionView = struct {
             return;
         } };
         self.outstanding += 1;
-        self.services.client.call("data.connect", .{
+        self.machine.call("data.connect", .{
             .session_id = self.session_id,
             .block_id = block_id,
             .data_ref_id = "terminal",
@@ -435,7 +439,7 @@ pub const SessionView = struct {
 
     fn onDividerDragged(ctx: *anyopaque, d: Divider, ratio: f64) void {
         const self: *SessionView = @ptrCast(@alignCast(ctx));
-        self.services.client.send("session.resize_pane", .{
+        self.machine.send("session.resize_pane", .{
             .session_id = self.session_id,
             .direction = if (d.vertical) "vertical" else "horizontal",
             .before_block_id = d.before,
@@ -545,7 +549,7 @@ pub const SessionView = struct {
         const res = api.parse(struct {
             blocks: []const struct { block_id: []const u8, owner: ?[]const u8 = null },
         }, msg) orelse return;
-        const me = self.services.client.clientId();
+        const me = self.machine.clientId();
         for (res.blocks) |b| if (self.blocks.get(b.block_id)) |block| if (block.pane) |p| {
             p.setOwned(if (b.owner) |o| std.mem.eql(u8, o, me) else false);
         };
@@ -576,7 +580,7 @@ pub const SessionView = struct {
         if (self.syncing) return;
         const tab = self.selectedTab() orelse return;
         tab.page.setNeedsAttention(0);
-        self.services.client.send("session.focus_window", .{
+        self.machine.send("session.focus_window", .{
             .session_id = self.session_id,
             .window_id = tab.window_id,
         });
@@ -591,9 +595,9 @@ pub const SessionView = struct {
         const tab = self.tabForPage(page) orelse return;
         const next: ?*Tab = if (position + 1 < view.getNPages()) self.tabForPage(view.getNthPage(position + 1)) else null;
         if (next) |n| {
-            self.services.client.send("session.move_window", .{ .session_id = self.session_id, .window_id = tab.window_id, .before_window_id = n.window_id });
+            self.machine.send("session.move_window", .{ .session_id = self.session_id, .window_id = tab.window_id, .before_window_id = n.window_id });
         } else {
-            self.services.client.send("session.move_window", .{ .session_id = self.session_id, .window_id = tab.window_id });
+            self.machine.send("session.move_window", .{ .session_id = self.session_id, .window_id = tab.window_id });
         }
     }
 
@@ -601,7 +605,7 @@ pub const SessionView = struct {
         if (self.syncing) return 0; // we're removing it: let it close
         // The user closed a tab: close the window on the server. The tab
         // goes away when the view without it arrives.
-        if (self.tabForPage(page)) |tab| self.services.client.send("session.close_window", .{
+        if (self.tabForPage(page)) |tab| self.machine.send("session.close_window", .{
             .session_id = self.session_id,
             .window_id = tab.window_id,
         });
@@ -623,7 +627,7 @@ pub const SessionView = struct {
             const p = api.parseValue(struct { block_id: []const u8, owner: ?[]const u8 = null }, msg, payload) orelse return;
             const b = self.blocks.get(p.block_id) orelse return;
             const pane = b.pane orelse return;
-            const me = self.services.client.clientId();
+            const me = self.machine.clientId();
             pane.setOwned(if (p.owner) |o| std.mem.eql(u8, o, me) else false);
         } else if (std.mem.eql(u8, event_type, "session_label_changed")) {
             const p = api.parseValue(struct { label: []const u8 }, msg, payload) orelse return;
@@ -697,7 +701,7 @@ pub const SessionView = struct {
 
     fn readClipboardPart(self: *SessionView, req: *ClipboardRead) void {
         self.outstanding += 1;
-        self.services.client.call("com.superlogical.terminal.clipboard_read", .{
+        self.machine.call("com.superlogical.terminal.clipboard_read", .{
             .session_id = self.session_id,
             .block_id = req.block_id,
             .args = .{ .id = req.id, .offset = req.text.items.len, .max_bytes = 983040 },

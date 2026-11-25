@@ -15,7 +15,7 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 const core = @import("core");
 const render = @import("render");
-const Client = @import("client.zig").Client;
+const Machine = @import("machine.zig").Machine;
 const Stream = @import("stream.zig").Stream;
 const StreamEnd = @import("stream.zig").End;
 const input = @import("input.zig");
@@ -32,8 +32,6 @@ const log = std.log.scoped(.terminal_view);
 pub const Services = struct {
     gpa: Allocator,
     io: std.Io,
-    socket_path: []const u8,
-    client: *Client,
     gpu: *render.renderer.Gpu,
     fonts: *render.fonts.Fonts,
     /// Cleared when GTK can't import a DMA-BUF; later frames use CPU copies.
@@ -66,6 +64,8 @@ const blink_interval_ms = 600;
 
 pub const Pane = struct {
     services: *Services,
+    /// The server the block lives on.
+    machine: *Machine,
     session_id: []u8,
     block_id: []u8,
     widget: *TerminalWidget,
@@ -123,13 +123,14 @@ pub const Pane = struct {
     on_exit: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, pane: *Pane) void } = null,
 
     /// Create the pane and its widget. Nothing shows until `connect`.
-    pub fn create(services: *Services, session_id: []const u8, block_id: []const u8) !*Pane {
+    pub fn create(services: *Services, machine: *Machine, session_id: []const u8, block_id: []const u8) !*Pane {
         const gpa = services.gpa;
         const self = try gpa.create(Pane);
         errdefer gpa.destroy(self);
 
         self.* = .{
             .services = services,
+            .machine = machine,
             .session_id = try gpa.dupe(u8, session_id),
             .block_id = try gpa.dupe(u8, block_id),
             .widget = TerminalWidget.new(),
@@ -149,7 +150,8 @@ pub const Pane = struct {
     pub fn connect(self: *Pane, ticket: []const u8) !void {
         if (self.stream) |s| s.destroy();
         self.stream = null;
-        self.stream = try Stream.create(self.services.gpa, self.services.io, self.services.socket_path, ticket, .{
+        const address = self.machine.dataEndpoint() orelse return error.NotConnected;
+        self.stream = try Stream.create(self.services.gpa, self.services.io, address, ticket, .{
             .ctx = self,
             .ready = onStreamReady,
             .bytes = onStreamBytes,
@@ -377,7 +379,7 @@ pub const Pane = struct {
         self.requested_cols = grid.cols;
         self.requested_rows = grid.rows;
         const cell = self.services.fonts.cellSize();
-        self.services.client.send("com.superlogical.terminal.resize", .{
+        self.machine.send("com.superlogical.terminal.resize", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
             .args = .{
@@ -565,7 +567,7 @@ pub const Pane = struct {
 
     /// A click on this pane: make it the focused block on the server.
     pub fn focusOnServer(self: *Pane) void {
-        if (!self.server_focused) self.services.client.send("session.focus_block", .{
+        if (!self.server_focused) self.machine.send("session.focus_block", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
         });
@@ -582,7 +584,7 @@ pub const Pane = struct {
     pub fn paste(self: *Pane, text: []const u8) void {
         if (text.len == 0) return;
         mouse.scrollToBottom(self);
-        self.services.client.send("block.event", .{
+        self.machine.send("block.event", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
             .event = .{ .type = "paste", .payload = .{ .text = text } },
@@ -648,7 +650,7 @@ pub const Pane = struct {
             input.keyvalText(&text_buf, keyval);
 
         const display = self.widget.as(gtk.Widget).getDisplay();
-        self.services.client.send("client.key", .{
+        self.machine.send("client.key", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
             .key = input.KeyEvent{
@@ -677,7 +679,7 @@ pub const Pane = struct {
             return;
         }
         // A composition finished outside a key press: type the text.
-        self.services.client.send("com.superlogical.terminal.write", .{
+        self.machine.send("com.superlogical.terminal.write", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
             .args = .{ .data = s },
@@ -707,7 +709,7 @@ pub const Pane = struct {
     pub fn pushTheme(self: *Pane) void {
         if (!self.owned) return;
         const theme = if (self.services.dark) dark_theme else light_theme;
-        self.services.client.send("com.superlogical.terminal.set_theme", .{
+        self.machine.send("com.superlogical.terminal.set_theme", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
             .args = theme,
@@ -728,7 +730,7 @@ pub const Pane = struct {
     }
 
     fn sendFocus(self: *Pane, action: []const u8) void {
-        self.services.client.send("block.event", .{
+        self.machine.send("block.event", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
             .event = .{ .type = "focus", .payload = .{ .action = action } },

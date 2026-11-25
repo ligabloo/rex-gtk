@@ -1,5 +1,5 @@
-//! The application: one window with the server's sessions in a sidebar
-//! and the selected session's windows as tabs.
+//! The application: one window with every machine's sessions in a
+//! sidebar and the selected session's windows as tabs.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,8 +11,11 @@ const gdk = @import("gdk");
 const glib = @import("glib");
 const gsk = @import("gsk");
 const render = @import("render");
-const Client = @import("client.zig").Client;
+const core = @import("core");
 const Incoming = @import("client.zig").Incoming;
+const machine_mod = @import("machine.zig");
+const Machine = machine_mod.Machine;
+const Settings = @import("settings.zig").Settings;
 const tv = @import("terminal_view.zig");
 const api = @import("api.zig");
 const SessionView = @import("session_view.zig").SessionView;
@@ -36,17 +39,34 @@ pub const Options = struct {
     screenshot: ?[:0]const u8 = null,
 };
 
-const SessionItem = struct {
+/// What main found in the environment.
+pub const Startup = struct {
+    /// This computer's server: REX_SERVER, or the default socket.
+    local_address: []const u8,
+    /// XDG_CONFIG_HOME, or HOME/.config; null if neither is set.
+    config_home: ?[]const u8 = null,
+    ssh_env: core.ssh.Env = .{ .ssh_auth_sock = null, .xdg_runtime_dir = null, .home = null },
+};
+
+/// A row of the sidebar: a machine's heading, or one of its sessions.
+const Row = struct {
+    machine: *Machine,
+    session: ?usize = null,
+};
+
+/// The session to show once its machine connects.
+const Want = struct {
+    machine_id: []u8,
     session_id: []u8,
-    label: []u8,
 };
 
 pub const App = struct {
     gpa: Allocator,
     io: std.Io,
     options: Options,
-    socket_path: []const u8,
+    startup: Startup,
     adw_app: *adw.Application,
+    settings: Settings,
 
     window: ?*adw.ApplicationWindow = null,
     window_title: ?*adw.WindowTitle = null,
@@ -63,30 +83,30 @@ pub const App = struct {
     prompts: prompts.Prompts = undefined,
 
     services: ?tv.Services = null,
-    /// The sessions in the sidebar, in the server's order.
-    sessions: std.ArrayList(SessionItem) = .empty,
+    /// This computer's server first, then the user's hosts.
+    machines: std.ArrayList(*Machine) = .empty,
+    hosts_pending: bool = false,
+    /// The sidebar's rows, in order.
+    rows: std.ArrayList(Row) = .empty,
     list_syncing: bool = false,
-    list_pending: bool = false,
     /// The session we show.
     view: ?*SessionView = null,
+    /// The session to show again after a reconnect, or the one
+    /// `--session HOST:SESSION` asked for.
+    want: ?Want = null,
+    /// --session applies to the first connection only.
+    session_option_used: bool = false,
 
-    /// Reconnecting after the control connection dropped: the session to
-    /// show again, the token that continues our client, and the attempt.
-    reattach_id: ?[]u8 = null,
-    reconnect_token: ?[]u8 = null,
-    reconnect_attempt: u32 = 0,
-    reconnect_id: c_uint = 0,
-    /// The client whose connection dropped, freed once we reconnect.
-    dead_client: ?*Client = null,
-
-    pub fn create(gpa: Allocator, io: std.Io, socket_path: []const u8, options: Options) !*App {
+    pub fn create(gpa: Allocator, io: std.Io, startup: Startup, options: Options) !*App {
         const self = try gpa.create(App);
+        errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
             .io = io,
             .options = options,
-            .socket_path = socket_path,
+            .startup = startup,
             .adw_app = adw.Application.new(app_id, .{ .non_unique = true }),
+            .settings = try .load(gpa, io, startup.config_home),
             .font_size = options.font_size,
         };
         self.keys = .init(gpa, self);
@@ -110,7 +130,7 @@ pub const App = struct {
     /// data stream, without a close frame, to test reconnecting.
     fn onDropSignal(data: ?*anyopaque) callconv(.c) c_int {
         const self: *App = @ptrCast(@alignCast(data.?));
-        if (self.services) |s| s.client.ctl.conn.shutdown();
+        if (self.machines.items.len > 0) if (self.rex().client) |c| c.ctl.conn.shutdown();
         return 1;
     }
 
@@ -138,6 +158,7 @@ pub const App = struct {
     pub fn destroy(self: *App) void {
         self.keys.deinit();
         self.prompts.deinit();
+        self.settings.deinit();
         self.adw_app.unref();
         self.gpa.destroy(self);
     }
@@ -308,18 +329,14 @@ pub const App = struct {
     fn onShutdown(_: *adw.Application, self: *App) callconv(.c) void {
         if (self.view) |v| v.destroy();
         self.view = null;
-        if (self.reconnect_id != 0) _ = glib.Source.remove(self.reconnect_id);
-        if (self.dead_client) |c| c.destroy();
-        self.dead_client = null;
-        if (self.reattach_id) |id| self.gpa.free(id);
-        if (self.reconnect_token) |t| self.gpa.free(t);
+        for (self.machines.items) |m| m.destroy();
+        self.machines.deinit(self.gpa);
+        self.rows.deinit(self.gpa);
+        self.clearWant();
         if (self.services) |*s| {
-            s.client.destroy();
             s.fonts.destroy();
             s.gpu.destroy();
         }
-        self.clearSessions();
-        self.sessions.deinit(self.gpa);
     }
 
     fn showStatus(self: *App, icon: [:0]const u8, title: [:0]const u8, description: ?[]const u8) void {
@@ -371,7 +388,7 @@ pub const App = struct {
     }
 
     // ------------------------------------------------------------------
-    // Connection
+    // Machines
 
     fn start(self: *App) !void {
         const gpu = try render.renderer.Gpu.create(self.gpa);
@@ -384,12 +401,9 @@ pub const App = struct {
         });
         errdefer fonts.destroy();
 
-        const client = try self.connectClient();
         self.services = .{
             .gpa = self.gpa,
             .io = self.io,
-            .socket_path = self.socket_path,
-            .client = client,
             .gpu = gpu,
             .fonts = fonts,
             .dump_frame = self.options.dump_frame,
@@ -405,24 +419,321 @@ pub const App = struct {
             .{ .detail = "dark" },
         );
 
-        self.keys.fetch();
+        // --session HOST:SESSION shows a session on one of the hosts. A
+        // session ID has a colon of its own ("session:…").
+        if (self.options.session) |want| if (std.mem.indexOfScalar(u8, want, ':')) |colon| {
+            const host = want[0..colon];
+            if (!std.ascii.eqlIgnoreCase(host, "session") and colon + 1 < want.len) {
+                self.setWant(host, want[colon + 1 ..]);
+                self.session_option_used = true;
+            }
+        };
 
-        // List the sessions, pick the one to show, then attach to it.
-        client.call("session.list", null, self, &onFirstSessionList);
+        const local = try Machine.create(self.gpa, self.io, self.machineListener(), .{
+            .id = "local",
+            .label = "This Computer",
+            .addresses = &.{self.startup.local_address},
+            .is_local = true,
+            .client_label = self.options.label,
+        });
+        errdefer local.destroy();
+        try self.machines.append(self.gpa, local);
+        local.connect(false);
     }
 
-    fn connectClient(self: *App) !*Client {
-        return Client.connect(self.gpa, self.io, self.socket_path, .{
-            .kind = "app",
-            .platform = "linux",
-            .name = "rex-gtk",
-            .version = "0.0.1",
-            .label = self.options.label,
-        }, self.reconnect_token, .{
+    fn machineListener(self: *App) machine_mod.Listener {
+        return .{
             .ctx = self,
-            .event = onEvent,
-            .disconnected = onDisconnected,
-        });
+            .connected = onMachineConnected,
+            .event = onMachineEvent,
+            .disconnected = onMachineDisconnected,
+            .changed = onMachineChanged,
+            .ssh_agent = sshAgent,
+            .window = dialogParent,
+        };
+    }
+
+    /// This computer's machine. Always present once started.
+    pub fn localMachine(self: *App) *Machine {
+        return self.machines.items[0];
+    }
+
+    /// The machine requests go to: the shown session's, else this
+    /// computer's.
+    pub fn rex(self: *App) *Machine {
+        if (self.view) |v| return v.machine;
+        return self.localMachine();
+    }
+
+    fn machineById(self: *App, id: []const u8) ?*Machine {
+        for (self.machines.items) |m| if (std.mem.eql(u8, m.id, id)) return m;
+        return null;
+    }
+
+    fn machineByLabel(self: *App, label: []const u8) ?*Machine {
+        for (self.machines.items) |m| if (std.ascii.eqlIgnoreCase(m.label, label)) return m;
+        return null;
+    }
+
+    fn setWant(self: *App, machine_id: []const u8, session_id: []const u8) void {
+        self.clearWant();
+        const mid = self.gpa.dupe(u8, machine_id) catch return;
+        const sid = self.gpa.dupe(u8, session_id) catch {
+            self.gpa.free(mid);
+            return;
+        };
+        self.want = .{ .machine_id = mid, .session_id = sid };
+    }
+
+    fn clearWant(self: *App) void {
+        const w = self.want orelse return;
+        self.gpa.free(w.machine_id);
+        self.gpa.free(w.session_id);
+        self.want = null;
+    }
+
+    /// The session `want` names on `m`, if it's for `m`. A want made from
+    /// --session names the host by label.
+    fn wantFor(self: *App, m: *Machine) ?[]const u8 {
+        const w = self.want orelse return null;
+        if (std.mem.eql(u8, w.machine_id, m.id) or std.ascii.eqlIgnoreCase(w.machine_id, m.label)) return w.session_id;
+        return null;
+    }
+
+    fn sshAgent(ctx: *anyopaque, gpa: Allocator) ?[]u8 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const ssh = core.ssh;
+        const name = self.settings.getString("ssh.agent", "default");
+        const agent: ssh.Agent = if (std.mem.eql(u8, name, "none"))
+            .none
+        else if (std.mem.eql(u8, name, "gnome_keyring"))
+            .gnome_keyring
+        else if (std.mem.eql(u8, name, "onepassword"))
+            .onepassword
+        else if (std.mem.eql(u8, name, "custom"))
+            .{ .custom = self.settings.getString("ssh.agent_path", "") }
+        else
+            .default;
+        const env = self.startup.ssh_env;
+        const path = ssh.agentSocket(gpa, agent, env) catch return null;
+        if (agent == .gnome_keyring) if (path) |p| {
+            std.Io.Dir.cwd().access(self.io, p, .{}) catch {
+                gpa.free(p);
+                return ssh.legacyKeyringSocket(gpa, env) catch null;
+            };
+        };
+        return path;
+    }
+
+    fn dialogParent(ctx: *anyopaque) ?*gtk.Widget {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return if (self.window) |w| w.as(gtk.Widget) else null;
+    }
+
+    fn onMachineConnected(ctx: *anyopaque, m: *Machine) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (m.is_local) {
+            self.keys.fetch();
+            self.refreshHosts();
+        }
+
+        // With nothing asked for, this computer's server picks the session
+        // and attaches it in the same call. Otherwise attach nothing yet:
+        // the session is found by ID or label once the list is in.
+        const tickets = &[_]api.TicketRequest{.{}};
+        const server_picks = m.is_local and self.view == null and self.want == null and
+            (self.options.session == null or self.session_option_used);
+        if (server_picks) {
+            m.call("session.bootstrap", .{
+                .event_scope = "all",
+                .data_tickets = tickets,
+            }, m, &onBootstrap);
+        } else {
+            m.call("session.bootstrap", .{
+                .event_scope = "all",
+                .attach_session_ids = &[_][]const u8{},
+            }, m, &onBootstrap);
+        }
+    }
+
+    /// The session on `m` that `text` names: its ID, its label, or the end
+    /// of its ID.
+    fn matchSession(m: *Machine, text: []const u8) ?[]const u8 {
+        for (m.sessions.items) |s| if (std.mem.eql(u8, s.session_id, text)) return s.session_id;
+        for (m.sessions.items) |s| if (std.mem.eql(u8, s.label, text)) return s.session_id;
+        for (m.sessions.items) |s| if (std.mem.endsWith(u8, s.session_id, text)) return s.session_id;
+        return null;
+    }
+
+    /// The listener's ctx is the app; responses carry the machine.
+    fn appOf(m: *Machine) *App {
+        return @ptrCast(@alignCast(m.listener.ctx));
+    }
+
+    fn onBootstrap(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
+        const m: *Machine = @ptrCast(@alignCast(ctx.?));
+        const self = appOf(m);
+        const msg = maybe_msg orelse return;
+        defer msg.deinit();
+        const boot = api.parse(api.Bootstrap, msg) orelse return self.failed("session.bootstrap");
+
+        if (boot.server_status) |st| if (st.host_id) |h| {
+            if (m.host_id) |old| self.gpa.free(old);
+            m.host_id = self.gpa.dupe(u8, h) catch null;
+        };
+        if (boot.attach_all) |all| m.setSessions(all.sessions);
+
+        // The server picked and attached a session.
+        if (boot.selected_session) |session| {
+            const view = self.showSession(m, session.session.session_id) orelse return;
+            view.apply(session.view, boot.data_tickets orelse &.{});
+            return;
+        }
+
+        // A session we were asked for: after a reconnect, or by --session.
+        var wanted: ?[]const u8 = self.wantFor(m);
+        if (wanted == null and m.is_local and self.view == null and !self.session_option_used) wanted = self.options.session;
+        if (m.is_local) self.session_option_used = true;
+        if (wanted) |text| {
+            const found = matchSession(m, text);
+            if (found == null) log.warn("{s} has no session {s}", .{ m.label, text });
+            const id = if (found) |f| self.gpa.dupe(u8, f) catch null else null;
+            defer if (id) |x| self.gpa.free(x);
+            if (self.wantFor(m) != null) self.clearWant();
+            if (id) |x| return self.switchSession(m, x);
+        }
+        if (self.view == null and (wanted != null or m.is_local)) self.showFirstSession();
+    }
+
+    fn failed(self: *App, what: []const u8) void {
+        log.err("{s} failed", .{what});
+        if (self.view == null) self.showStatus("dialog-error-symbolic", "Rex request failed", what);
+    }
+
+    fn onMachineDisconnected(ctx: *anyopaque, m: *Machine) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (m.is_local) {
+            self.prompts.deinit();
+            self.prompts = .init(self.gpa, self);
+        }
+        const view = self.view orelse return;
+        if (view.machine != m) return;
+        // Show it again once the machine is back.
+        self.setWant(m.id, view.session_id);
+        view.destroy();
+        self.view = null;
+        self.updateTitle();
+        self.showMachineStatus(m);
+    }
+
+    fn onMachineChanged(ctx: *anyopaque, m: *Machine) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.rebuildSidebar();
+        if (self.view == null and self.statusMachine() == m) self.showMachineStatus(m);
+    }
+
+    /// The machine whose state the content area shows while no session
+    /// is shown.
+    fn statusMachine(self: *App) ?*Machine {
+        if (self.want) |w| {
+            if (self.machineById(w.machine_id)) |m| return m;
+            if (self.machineByLabel(w.machine_id)) |m| return m;
+        }
+        if (self.machines.items.len == 0) return null;
+        return self.localMachine();
+    }
+
+    fn showMachineStatus(self: *App, m: *Machine) void {
+        var buf: [256]u8 = undefined;
+        switch (m.state) {
+            .idle, .connecting => {
+                const t = std.fmt.bufPrintSentinel(&buf, "Connecting to {s}…", .{if (m.is_local) "Rex" else m.label}, 0) catch "Connecting…";
+                self.showStatus("network-transmit-receive-symbolic", t, null);
+            },
+            .offline => {
+                const t = std.fmt.bufPrintSentinel(&buf, "Can't reach {s}", .{if (m.is_local) "Rex" else m.label}, 0) catch "Can't connect";
+                self.showStatus("network-offline-symbolic", t, m.detail);
+            },
+            .connected => {},
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Hosts
+
+    fn refreshHosts(self: *App) void {
+        if (self.hosts_pending) return;
+        self.hosts_pending = true;
+        self.localMachine().call("hosts.list", null, self, &onHostsList);
+    }
+
+    fn onHostsList(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
+        const self: *App = @ptrCast(@alignCast(ctx.?));
+        self.hosts_pending = false;
+        const msg = maybe_msg orelse return;
+        defer msg.deinit();
+        const list = api.parse(api.Hosts, msg) orelse return;
+        const hosts = list.hosts orelse &.{};
+        const local = self.localMachine();
+
+        // Drop machines whose host is gone.
+        var i: usize = 1;
+        while (i < self.machines.items.len) {
+            const m = self.machines.items[i];
+            const keep = for (hosts) |h| {
+                if (std.mem.eql(u8, h.id, m.id)) break true;
+            } else false;
+            if (keep) {
+                i += 1;
+                continue;
+            }
+            _ = self.machines.orderedRemove(i);
+            self.removeMachine(m);
+        }
+
+        for (hosts) |h| {
+            if (h.id.len == 0) continue;
+            // This computer may be in its own list, by its tailnet name.
+            if (h.host_id) |hid| if (local.host_id) |lid| if (std.mem.eql(u8, hid, lid)) continue;
+            const endpoints = h.endpoints orelse &.{};
+            if (self.machineById(h.id)) |m| {
+                m.update(h.label, h.icon, endpoints);
+                continue;
+            }
+            const m = Machine.create(self.gpa, self.io, self.machineListener(), .{
+                .id = h.id,
+                .label = h.label,
+                .icon = h.icon,
+                .addresses = endpoints,
+                .client_label = self.options.label,
+            }) catch continue;
+            self.machines.append(self.gpa, m) catch {
+                m.destroy();
+                continue;
+            };
+            m.connect(false);
+        }
+        self.rebuildSidebar();
+    }
+
+    fn removeMachine(self: *App, m: *Machine) void {
+        if (self.view) |v| if (v.machine == m) {
+            v.destroy();
+            self.view = null;
+            self.updateTitle();
+        };
+        m.destroy();
+        self.rebuildSidebar();
+        if (self.view == null) self.showFirstSession();
+    }
+
+    /// Show any session at all, this computer's first.
+    fn showFirstSession(self: *App) void {
+        for (self.machines.items) |m| if (m.state == .connected and m.sessions.items.len > 0) {
+            return self.switchSession(m, m.sessions.items[0].session_id);
+        };
+        if (self.statusMachine()) |m| if (m.state != .connected) return self.showMachineStatus(m);
+        self.showStatus("utilities-terminal-symbolic", "No sessions", "Create one with `rex new`.");
     }
 
     fn onDarkChanged(sm: *adw.StyleManager, _: *gobject.ParamSpec, self: *App) callconv(.c) void {
@@ -437,78 +748,17 @@ pub const App = struct {
         return @floatFromInt(@max(1, s));
     }
 
-    pub fn rex(self: *App) *Client {
-        return self.services.?.client;
-    }
-
-    fn onFirstSessionList(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
-        const self: *App = @ptrCast(@alignCast(ctx.?));
-        const msg = maybe_msg orelse return;
-        defer msg.deinit();
-        const list = api.parse(api.SessionList, msg) orelse return self.failed("session.list");
-        self.setSessions(list);
-
-        var attach: ?[]const u8 = null;
-        if (self.reattach_id) |id| for (list.sessions) |s| {
-            if (std.mem.eql(u8, s.session_id, id)) attach = s.session_id;
-        };
-        if (attach == null) if (self.options.session) |want| {
-            for (list.sessions) |s| {
-                if (std.mem.eql(u8, s.session_id, want) or std.mem.eql(u8, s.label, want) or
-                    std.mem.endsWith(u8, s.session_id, want)) attach = s.session_id;
-            }
-            if (attach == null) log.warn("no session matches {s}; letting the server pick", .{want});
-        };
-
-        const tickets = &[_]api.TicketRequest{.{}};
-        if (attach) |id| {
-            self.rex().call("session.bootstrap", .{
-                .event_scope = "session",
-                .attach_session_ids = &[_][]const u8{id},
-                .data_tickets = tickets,
-            }, self, &onBootstrap);
-        } else {
-            self.rex().call("session.bootstrap", .{
-                .event_scope = "session",
-                .data_tickets = tickets,
-            }, self, &onBootstrap);
-        }
-    }
-
-    fn onBootstrap(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
-        const self: *App = @ptrCast(@alignCast(ctx.?));
-        const msg = maybe_msg orelse return;
-        defer msg.deinit();
-        const boot = api.parse(api.Bootstrap, msg) orelse return self.failed("session.bootstrap");
-
-        const attached: ?api.Attached = if (boot.selected_session) |s| s else if (boot.attached_sessions) |list|
-            (if (list.len > 0) list[0] else null)
-        else
-            null;
-        const session = attached orelse {
-            self.showStatus("utilities-terminal-symbolic", "No sessions", "Create one with `rex new`.");
-            return;
-        };
-        const view = self.showSession(session.session.session_id) orelse return;
-        view.apply(session.view, boot.data_tickets orelse &.{});
-    }
-
-    fn failed(self: *App, what: []const u8) void {
-        log.err("{s} failed", .{what});
-        self.showStatus("dialog-error-symbolic", "Rex request failed", what);
-    }
-
     // ------------------------------------------------------------------
     // Sessions
 
     /// Replace the shown session with a new, empty view of `session_id`.
-    fn showSession(self: *App, session_id: []const u8) ?*SessionView {
+    fn showSession(self: *App, m: *Machine, session_id: []const u8) ?*SessionView {
         if (self.view) |old| {
-            self.rex().send("session.detach", .{ .session_id = old.session_id });
+            old.machine.send("session.detach", .{ .session_id = old.session_id });
             old.destroy();
             self.view = null;
         }
-        const view = SessionView.create(self.gpa, &self.services.?, session_id, .{
+        const view = SessionView.create(self.gpa, &self.services.?, m, session_id, .{
             .ctx = self,
             .changed = onViewChanged,
         }) catch |err| {
@@ -523,23 +773,35 @@ pub const App = struct {
         return view;
     }
 
-    /// Switch to another session: detach from the one shown, attach to it.
-    pub fn switchSession(self: *App, session_id: []const u8) void {
-        if (self.view) |v| if (std.mem.eql(u8, v.session_id, session_id)) return;
-        const view = self.showSession(session_id) orelse return;
+    /// Switch to a session: detach from the one shown, attach to it.
+    pub fn switchSession(self: *App, m: *Machine, session_id: []const u8) void {
+        if (self.view) |v| if (v.machine == m and std.mem.eql(u8, v.session_id, session_id)) return;
+        if (m.state != .connected) return;
+        const view = self.showSession(m, session_id) orelse return;
         self.updateTitle();
-        self.rex().call("session.attach", .{ .session_id = view.session_id }, self, &onAttached);
+        m.call("session.attach", .{ .session_id = view.session_id }, m, &onAttached);
+    }
+
+    /// Switch to a session by ID on whichever machine has it, preferring
+    /// the shown session's machine.
+    pub fn switchSessionById(self: *App, session_id: []const u8) void {
+        const current = self.rex();
+        if (current.hasSession(session_id)) return self.switchSession(current, session_id);
+        for (self.machines.items) |m| if (m.hasSession(session_id)) return self.switchSession(m, session_id);
+        // Too new to be listed yet.
+        self.switchSession(current, session_id);
     }
 
     fn onAttached(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
-        const self: *App = @ptrCast(@alignCast(ctx.?));
+        const m: *Machine = @ptrCast(@alignCast(ctx.?));
+        const self = appOf(m);
         const msg = maybe_msg orelse return;
         defer msg.deinit();
         const res = api.parse(struct { view: api.View }, msg) orelse return;
         const view = self.view orelse return;
         // The user may have switched again meanwhile.
         const id = res.view.session_id orelse return;
-        if (!std.mem.eql(u8, id, view.session_id)) return;
+        if (view.machine != m or !std.mem.eql(u8, id, view.session_id)) return;
         view.apply(res.view, &.{});
     }
 
@@ -563,45 +825,117 @@ pub const App = struct {
         return page;
     }
 
-    fn clearSessions(self: *App) void {
-        for (self.sessions.items) |s| {
-            self.gpa.free(s.session_id);
-            self.gpa.free(s.label);
-        }
-        self.sessions.clearRetainingCapacity();
+    /// Every session of every connected machine, in sidebar order, for
+    /// stepping through them.
+    pub fn sessionCount(self: *App) usize {
+        var n: usize = 0;
+        for (self.machines.items) |m| if (m.state == .connected) {
+            n += m.sessions.items.len;
+        };
+        return n;
     }
 
-    fn setSessions(self: *App, list: api.SessionList) void {
-        self.clearSessions();
-        const box = self.session_list.?;
+    /// Show the session `step` places from the shown one, wrapping.
+    pub fn stepSession(self: *App, step: i64) void {
+        const n = self.sessionCount();
+        if (n == 0) return;
+        var current: i64 = 0;
+        var i: i64 = 0;
+        if (self.view) |v| for (self.machines.items) |m| if (m.state == .connected) {
+            for (m.sessions.items) |s| {
+                if (m == v.machine and std.mem.eql(u8, s.session_id, v.session_id)) current = i;
+                i += 1;
+            }
+        };
+        var target: usize = @intCast(@mod(current + step, @as(i64, @intCast(n))));
+        for (self.machines.items) |m| if (m.state == .connected) {
+            if (target < m.sessions.items.len) return self.switchSession(m, m.sessions.items[target].session_id);
+            target -= m.sessions.items.len;
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Sidebar
+
+    fn rebuildSidebar(self: *App) void {
+        const box = self.session_list orelse return;
         self.list_syncing = true;
         defer self.list_syncing = false;
         box.removeAll();
-        for (list.sessions) |s| {
-            const item: SessionItem = .{
-                .session_id = self.gpa.dupe(u8, s.session_id) catch continue,
-                .label = self.gpa.dupe(u8, s.label) catch continue,
-            };
-            self.sessions.append(self.gpa, item) catch continue;
-            var buf: [256]u8 = undefined;
-            const text = std.fmt.bufPrintSentinel(&buf, "{s}", .{if (s.label.len > 0) s.label else s.session_id}, 0) catch "session";
-            const label = gtk.Label.new(text);
-            label.setXalign(0);
-            label.setEllipsize(.end);
-            box.append(label.as(gtk.Widget));
+        self.rows.clearRetainingCapacity();
+        for (self.machines.items) |m| {
+            self.rows.append(self.gpa, .{ .machine = m }) catch return;
+            box.append(self.machineRow(m).as(gtk.Widget));
+            if (m.state != .connected) continue;
+            for (m.sessions.items, 0..) |s, i| {
+                self.rows.append(self.gpa, .{ .machine = m, .session = i }) catch return;
+                var buf: [256]u8 = undefined;
+                const text = std.fmt.bufPrintSentinel(&buf, "{s}", .{if (s.label.len > 0) s.label else s.session_id}, 0) catch "session";
+                const label = gtk.Label.new(text);
+                label.setXalign(0);
+                label.setEllipsize(.end);
+                label.as(gtk.Widget).setMarginStart(12);
+                box.append(label.as(gtk.Widget));
+            }
         }
         self.selectCurrentRow();
     }
 
+    /// A machine's heading: its name, and a warning to try again when it
+    /// can't be reached.
+    fn machineRow(self: *App, m: *Machine) *gtk.ListBoxRow {
+        const row = gtk.ListBoxRow.new();
+        row.setActivatable(0);
+        row.setSelectable(0);
+        const hbox = gtk.Box.new(.horizontal, 6);
+        const icon = gtk.Image.newFromIconName(if (m.is_local) "computer-symbolic" else "network-server-symbolic");
+        hbox.append(icon.as(gtk.Widget));
+        var buf: [128]u8 = undefined;
+        const name = std.fmt.bufPrintSentinel(&buf, "{s}", .{m.title()}, 0) catch "Machine";
+        const label = gtk.Label.new(name);
+        label.setXalign(0);
+        label.setEllipsize(.end);
+        label.as(gtk.Widget).setHexpand(1);
+        label.as(gtk.Widget).addCssClass("heading");
+        hbox.append(label.as(gtk.Widget));
+        switch (m.state) {
+            .connecting => {
+                const spinner = adw.Spinner.new();
+                hbox.append(spinner.as(gtk.Widget));
+            },
+            .offline => {
+                const button = gtk.Button.newFromIconName("dialog-warning-symbolic");
+                button.as(gtk.Widget).addCssClass("flat");
+                var tip: [512]u8 = undefined;
+                const text = std.fmt.bufPrintSentinel(&tip, "Can't reach {s}. {s} Click to try again.", .{ m.title(), m.detail orelse "" }, 0) catch "Click to try again.";
+                button.as(gtk.Widget).setTooltipText(text);
+                _ = gtk.Button.signals.clicked.connect(button, *Machine, &onRetryClicked, m, .{});
+                hbox.append(button.as(gtk.Widget));
+            },
+            .idle, .connected => {},
+        }
+        row.setChild(hbox.as(gtk.Widget));
+        _ = self;
+        return row;
+    }
+
+    fn onRetryClicked(_: *gtk.Button, m: *Machine) callconv(.c) void {
+        m.connect(true);
+    }
+
     fn selectCurrentRow(self: *App) void {
         const box = self.session_list orelse return;
-        const view = self.view orelse return;
         self.list_syncing = true;
         defer self.list_syncing = false;
-        for (self.sessions.items, 0..) |s, i| if (std.mem.eql(u8, s.session_id, view.session_id)) {
-            box.selectRow(box.getRowAtIndex(@intCast(i)));
-            return;
-        };
+        const view = self.view orelse return box.selectRow(null);
+        for (self.rows.items, 0..) |r, i| {
+            const si = r.session orelse continue;
+            if (r.machine != view.machine) continue;
+            if (std.mem.eql(u8, r.machine.sessions.items[si].session_id, view.session_id)) {
+                box.selectRow(box.getRowAtIndex(@intCast(i)));
+                return;
+            }
+        }
         box.selectRow(null);
     }
 
@@ -609,87 +943,93 @@ pub const App = struct {
         if (self.list_syncing) return;
         const r = row orelse return;
         const i: usize = @intCast(r.getIndex());
-        if (i >= self.sessions.items.len) return;
-        self.switchSession(self.sessions.items[i].session_id);
-    }
-
-    fn refreshSessions(self: *App) void {
-        if (self.list_pending) return;
-        self.list_pending = true;
-        self.rex().call("session.list", null, self, &onSessionList);
-    }
-
-    fn onSessionList(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
-        const self: *App = @ptrCast(@alignCast(ctx.?));
-        self.list_pending = false;
-        const msg = maybe_msg orelse return;
-        defer msg.deinit();
-        const list = api.parse(api.SessionList, msg) orelse return;
-        self.setSessions(list);
+        if (i >= self.rows.items.len) return;
+        const entry = self.rows.items[i];
+        const si = entry.session orelse return;
+        if (si >= entry.machine.sessions.items.len) return;
+        self.switchSession(entry.machine, entry.machine.sessions.items[si].session_id);
     }
 
     /// The shown session is gone: show another, or say there are none.
-    fn sessionGone(self: *App, session_id: []const u8) void {
+    fn sessionGone(self: *App, m: *Machine, session_id: []const u8) void {
         const view = self.view orelse return;
-        if (!std.mem.eql(u8, view.session_id, session_id)) return;
+        if (view.machine != m or !std.mem.eql(u8, view.session_id, session_id)) return;
         view.destroy();
         self.view = null;
         self.updateTitle();
         // Prefer the session after the one that ended, then the one before.
-        const items = self.sessions.items;
+        const items = m.sessions.items;
         const gone = for (items, 0..) |s, i| {
             if (std.mem.eql(u8, s.session_id, session_id)) break i;
         } else items.len;
         const next: ?usize = if (gone + 1 < items.len) gone + 1 else if (gone > 0 and items.len > 0) @min(gone, items.len) - 1 else null;
-        if (next) |i| if (!std.mem.eql(u8, items[i].session_id, session_id)) return self.switchSession(items[i].session_id);
+        if (next) |i| if (!std.mem.eql(u8, items[i].session_id, session_id)) return self.switchSession(m, items[i].session_id);
+        self.showFirstSessionExcept(m, session_id);
+    }
+
+    fn showFirstSessionExcept(self: *App, m: *Machine, session_id: []const u8) void {
+        for (self.machines.items) |other| if (other.state == .connected) {
+            for (other.sessions.items) |s| {
+                if (other == m and std.mem.eql(u8, s.session_id, session_id)) continue;
+                return self.switchSession(other, s.session_id);
+            }
+        };
         self.showStatus("utilities-terminal-symbolic", "No sessions", "Create one with `rex new`.");
     }
 
     // ------------------------------------------------------------------
     // Events
 
-    fn onEvent(ctx: ?*anyopaque, msg: Incoming) void {
-        const self: *App = @ptrCast(@alignCast(ctx.?));
+    fn onMachineEvent(ctx: *anyopaque, m: *Machine, msg: Incoming) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
         defer msg.deinit();
         const ev = msg.kind.event;
+        const eq = std.mem.eql;
 
-        if (std.mem.eql(u8, ev.name, "event_dropped")) {
+        if (eq(u8, ev.name, "event_dropped")) {
             // Fetch again whatever the event would have changed.
             const p = api.parseValue(struct { event_type: []const u8 = "", session_id: ?[]const u8 = null }, msg, ev.payload) orelse return;
-            log.warn("the server dropped a {s} event", .{p.event_type});
+            log.warn("{s} dropped a {s} event", .{ m.label, p.event_type });
             if (p.session_id) |sid| {
-                if (self.view) |v| if (std.mem.eql(u8, v.session_id, sid)) v.refreshView();
+                if (self.view) |v| if (v.machine == m and eq(u8, v.session_id, sid)) v.refreshView();
             }
-            if (std.mem.eql(u8, p.event_type, "keymap_changed")) self.keys.fetch();
-            self.refreshSessions();
-        } else if (std.mem.eql(u8, ev.name, "keymap_changed")) {
+            if (m.is_local and eq(u8, p.event_type, "keymap_changed")) self.keys.fetch();
+            if (m.is_local and eq(u8, p.event_type, "hosts_changed")) self.refreshHosts();
+            m.refreshSessions();
+        } else if (eq(u8, ev.name, "keymap_changed")) {
+            if (!m.is_local) return;
             const p = api.parseValue(struct { hash: []const u8 = "" }, msg, ev.payload) orelse return;
             self.keys.changed(p.hash);
-        } else if (std.mem.eql(u8, ev.name, "client_perform_requested")) {
-            self.performRequested(msg, ev.payload);
-        } else if (std.mem.eql(u8, ev.name, "client_prompt_requested")) {
-            self.prompts.show(msg, ev.payload);
-        } else if (std.mem.eql(u8, ev.name, "client_prompt_ended")) {
+        } else if (eq(u8, ev.name, "hosts_changed")) {
+            if (m.is_local) self.refreshHosts();
+        } else if (eq(u8, ev.name, "client_perform_requested")) {
+            self.performRequested(m, msg, ev.payload);
+        } else if (eq(u8, ev.name, "client_prompt_requested")) {
+            // Prompts come from the configuration file's actions, which
+            // run on this computer's server.
+            if (m.is_local) self.prompts.show(msg, ev.payload);
+        } else if (eq(u8, ev.name, "client_prompt_ended")) {
+            if (!m.is_local) return;
             const p = api.parseValue(struct { call_id: []const u8 }, msg, ev.payload) orelse return;
             self.prompts.end(p.call_id);
-        } else if (std.mem.eql(u8, ev.name, "session_created") or std.mem.eql(u8, ev.name, "session_moved")) {
-            self.refreshSessions();
-        } else if (std.mem.eql(u8, ev.name, "session_destroyed")) {
+        } else if (eq(u8, ev.name, "session_created") or eq(u8, ev.name, "session_moved")) {
+            m.refreshSessions();
+        } else if (eq(u8, ev.name, "session_destroyed")) {
             const p = api.parseValue(struct { session_id: []const u8 }, msg, ev.payload) orelse return;
-            self.refreshSessions();
-            self.sessionGone(p.session_id);
-        } else if (std.mem.eql(u8, ev.name, "session_event")) {
+            m.refreshSessions();
+            self.sessionGone(m, p.session_id);
+        } else if (eq(u8, ev.name, "session_event")) {
             const se = api.parseValue(api.SessionEvent, msg, ev.payload) orelse return;
-            if (std.mem.eql(u8, se.event.type, "session_label_changed")) self.refreshSessions();
+            if (eq(u8, se.event.type, "session_label_changed")) m.refreshSessions();
             const view = self.view orelse return;
-            if (!std.mem.eql(u8, se.session_id, view.session_id)) return;
+            if (view.machine != m or !eq(u8, se.session_id, view.session_id)) return;
             view.handleEvent(msg, se.event.type, se.event.payload);
         }
     }
 
     /// Another client asked us to perform one of our actions, such as
     /// `rex -C linux do pane.split.right`.
-    fn performRequested(self: *App, msg: Incoming, payload: std.json.Value) void {
+    fn performRequested(self: *App, m: *Machine, msg: Incoming, payload: std.json.Value) void {
         const req = api.parseValue(struct {
             call_id: []const u8,
             action: []const u8,
@@ -698,7 +1038,7 @@ pub const App = struct {
         const Err = struct { code: []const u8, message: []const u8 };
         if (std.mem.startsWith(u8, req.action, "client.mode.")) {
             self.keys.perform(req.action, req.args, "api");
-            return self.rex().send("client.reply", .{ .call_id = req.call_id, .result = std.json.Value.null });
+            return m.send("client.reply", .{ .call_id = req.call_id, .result = std.json.Value.null });
         }
         actions.perform(self, req.action, req.args) catch |err| {
             const e: Err = switch (err) {
@@ -706,77 +1046,8 @@ pub const App = struct {
                 error.BadArgs => .{ .code = "refused", .message = "missing or wrong arguments" },
                 error.NoTarget => .{ .code = "refused", .message = "nothing to act on" },
             };
-            return self.rex().send("client.reply", .{ .call_id = req.call_id, .@"error" = e });
+            return m.send("client.reply", .{ .call_id = req.call_id, .@"error" = e });
         };
-        self.rex().send("client.reply", .{ .call_id = req.call_id, .result = std.json.Value.null });
-    }
-
-    fn onDisconnected(ctx: ?*anyopaque) void {
-        const self: *App = @ptrCast(@alignCast(ctx.?));
-        log.warn("lost the connection to the Rex server; reconnecting", .{});
-        const services = if (self.services) |*s| s else return;
-
-        // Remember where we were and how to continue our client.
-        if (self.view) |v| {
-            if (self.reattach_id) |old| self.gpa.free(old);
-            self.reattach_id = self.gpa.dupe(u8, v.session_id) catch null;
-            v.destroy();
-            self.view = null;
-        }
-        if (self.reconnect_token) |t| self.gpa.free(t);
-        self.reconnect_token = self.gpa.dupe(u8, services.client.ctl.reconnectToken()) catch null;
-        self.dead_client = services.client;
-        self.prompts.deinit();
-        self.prompts = .init(self.gpa, self);
-        self.reconnect_attempt = 0;
-        self.showStatus("network-offline-symbolic", "Reconnecting to Rex…", null);
-        self.scheduleReconnect(250);
-    }
-
-    fn scheduleReconnect(self: *App, delay_ms: c_uint) void {
-        if (self.reconnect_id != 0) _ = glib.Source.remove(self.reconnect_id);
-        self.reconnect_id = glib.timeoutAdd(delay_ms, &onReconnect, self);
-    }
-
-    fn onReconnect(data: ?*anyopaque) callconv(.c) c_int {
-        const self: *App = @ptrCast(@alignCast(data.?));
-        self.reconnect_id = 0;
-        self.reconnect_attempt += 1;
-        const services = if (self.services) |*s| s else return 0;
-
-        // The server may have stopped; ask the rex CLI to start it.
-        if (self.reconnect_attempt == 2) startServer();
-
-        const client = self.connectClient() catch |err| {
-            const delay: c_uint = @min(5000, @as(c_uint, 250) << @intCast(@min(self.reconnect_attempt, 5)));
-            var buf: [128]u8 = undefined;
-            const note = std.fmt.bufPrint(&buf, "{s}. Trying again in {d} s.", .{ @errorName(err), (delay + 999) / 1000 }) catch "";
-            self.showStatus("network-offline-symbolic", "Reconnecting to Rex…", note);
-            self.scheduleReconnect(delay);
-            return 0;
-        };
-        log.info("reconnected (resumed: {})", .{client.ctl.resumed});
-        if (self.dead_client) |old| old.destroy();
-        self.dead_client = null;
-        services.client = client;
-        if (self.reconnect_token) |t| self.gpa.free(t);
-        self.reconnect_token = null;
-        self.keys.fetch();
-        self.rex().call("session.list", null, self, &onFirstSessionList);
-        return 0;
-    }
-
-    /// Start the Rex server if it isn't running, the way the rex CLI does.
-    fn startServer() void {
-        const argv = [_:null]?[*:0]const u8{ "rex", "__internal", "autostart-status", null };
-        var err: ?*glib.Error = null;
-        const proc = gio.Subprocess.newv(@ptrCast(&argv), .{ .stdout_silence = true, .stderr_silence = true }, &err) orelse {
-            if (err) |e| {
-                log.warn("starting the Rex server failed: {s}", .{e.f_message orelse "?"});
-                e.free();
-            }
-            return;
-        };
-        proc.as(gobject.Object).unref();
+        m.send("client.reply", .{ .call_id = req.call_id, .result = std.json.Value.null });
     }
 };

@@ -138,7 +138,7 @@ fn setHeld(st: *State, button: c_uint, held: bool) void {
 fn sendMouse(pane: *Pane, action: []const u8, button: c_uint, cell: Cell, state: gdk.ModifierType) void {
     var mods_buf: [64]u8 = undefined;
     const st = &pane.pointer;
-    pane.services.client.send("block.event", .{
+    pane.machine.send("block.event", .{
         .session_id = pane.session_id,
         .block_id = pane.block_id,
         .event = .{ .type = "mouse", .payload = .{
@@ -314,7 +314,7 @@ fn onScroll(ctrl: *gtk.EventControllerScroll, dx: f64, dy: f64, pane: *Pane) cal
     if (reporting(t, state) or t.screens.active_key == .alternate) {
         var mods_buf: [64]u8 = undefined;
         const cell = cellAt(pane, t, st.x, st.y);
-        pane.services.client.send("block.event", .{
+        pane.machine.send("block.event", .{
             .session_id = pane.session_id,
             .block_id = pane.block_id,
             .event = .{ .type = "wheel", .payload = .{

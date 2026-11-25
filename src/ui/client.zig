@@ -27,7 +27,6 @@ pub const Handler = struct {
 pub const Client = struct {
     gpa: Allocator,
     io: std.Io,
-    socket_path: []const u8,
     ctl: *control.Control,
     handler: Handler,
     thread: ?std.Thread = null,
@@ -39,21 +38,14 @@ pub const Client = struct {
         callback: ResponseFn,
     };
 
-    pub fn connect(
-        gpa: Allocator,
-        io: std.Io,
-        socket_path: []const u8,
-        info: control.ClientInfo,
-        reconnect_token: ?[]const u8,
-        handler: Handler,
-    ) !*Client {
-        const ctl = try control.Control.connect(gpa, io, .{ .unix = socket_path }, .{ .info = info, .reconnect_token = reconnect_token });
-        errdefer ctl.destroy();
+    /// Take over a control connection that has said hello, and start
+    /// reading from it. On error the caller keeps `ctl`.
+    pub fn start(gpa: Allocator, io: std.Io, ctl: *control.Control, handler: Handler) !*Client {
         const self = try gpa.create(Client);
+        errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
             .io = io,
-            .socket_path = socket_path,
             .ctl = ctl,
             .handler = handler,
         };

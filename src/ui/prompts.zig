@@ -73,7 +73,7 @@ pub const Prompts = struct {
     }
 
     fn reply(self: *Prompts, call_id: []const u8, result: anytype) void {
-        self.app.rex().send("client.reply", .{ .call_id = call_id, .result = result });
+        self.app.localMachine().send("client.reply", .{ .call_id = call_id, .result = result });
     }
 
     pub fn show(self: *Prompts, msg: Incoming, payload: std.json.Value) void {
@@ -82,7 +82,7 @@ pub const Prompts = struct {
         const is_input = std.mem.eql(u8, p.kind, "input");
         const is_pick = std.mem.eql(u8, p.kind, "pick");
         if (!is_input and !is_pick) {
-            self.app.rex().send("client.reply", .{
+            self.app.localMachine().send("client.reply", .{
                 .call_id = req.call_id,
                 .@"error" = .{ .code = "not_supported", .message = "rex-gtk can't show this kind of prompt" },
             });

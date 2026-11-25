@@ -98,7 +98,8 @@ pub const Keys = struct {
             .action = b.action,
             .args = if (b.args) |s| std.json.parseFromSliceLeaky(std.json.Value, a, s, .{}) catch null else null,
         };
-        self.app.rex().call("client.keymap", .{
+        // The keymap is this computer's, whichever machine is shown.
+        self.app.localMachine().call("client.keymap", .{
             .actions = decls,
             .server_actions = "all",
             .defaults = &[_]struct { name: []const u8, bindings: []const B }{.{ .name = "default", .bindings = defaults }},

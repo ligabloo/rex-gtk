@@ -122,7 +122,7 @@ pub fn perform(app: *App, name: []const u8, args: std.json.Value) Error!void {
     if (eq(u8, name, "session.new")) return newSession(app);
     if (eq(u8, name, "session.select")) {
         const id = argString(args, "session_id") orelse return error.BadArgs;
-        return app.switchSession(id);
+        return app.switchSessionById(id);
     }
     if (eq(u8, name, "session.next")) return stepSession(app, 1);
     if (eq(u8, name, "session.previous")) return stepSession(app, -1);
@@ -287,14 +287,8 @@ fn moveTab(app: *App, view: *sv.SessionView, forward: bool) Error!void {
 }
 
 fn stepSession(app: *App, step: i64) Error!void {
-    const items = app.sessions.items;
-    if (items.len == 0) return error.NoTarget;
-    const current: i64 = if (app.view) |v| for (items, 0..) |s, i| {
-        if (std.mem.eql(u8, s.session_id, v.session_id)) break @intCast(i);
-    } else 0 else 0;
-    const n: i64 = @intCast(items.len);
-    const next: usize = @intCast(@mod(current + step, n));
-    app.switchSession(items[next].session_id);
+    if (app.sessionCount() == 0) return error.NoTarget;
+    app.stepSession(step);
 }
 
 fn newSession(app: *App) void {
@@ -306,7 +300,7 @@ fn onSessionCreated(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
     const msg = maybe_msg orelse return;
     defer msg.deinit();
     const res = api.parse(struct { session: struct { session_id: []const u8 } }, msg) orelse return;
-    app.switchSession(res.session.session_id);
+    app.switchSessionById(res.session.session_id);
 }
 
 // ----------------------------------------------------------------------

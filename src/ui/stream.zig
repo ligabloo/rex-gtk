@@ -45,7 +45,8 @@ const busy_window_us = 4 * std.time.us_per_ms;
 pub const Stream = struct {
     gpa: Allocator,
     io: std.Io,
-    socket_path: []const u8,
+    /// Where to connect, in a form `endpoint.parse` takes. Owned.
+    address: []u8,
     ticket: []u8,
     sink: Sink,
     thread: ?std.Thread = null,
@@ -70,13 +71,15 @@ pub const Stream = struct {
     feeding: std.atomic.Value(bool) = .init(false),
     last_drain_us: std.atomic.Value(i64) = .init(0),
 
-    pub fn create(gpa: Allocator, io: std.Io, socket_path: []const u8, ticket: []const u8, sink: Sink) !*Stream {
+    pub fn create(gpa: Allocator, io: std.Io, address: []const u8, ticket: []const u8, sink: Sink) !*Stream {
         const self = try gpa.create(Stream);
         errdefer gpa.destroy(self);
+        const addr = try gpa.dupe(u8, address);
+        errdefer gpa.free(addr);
         self.* = .{
             .gpa = gpa,
             .io = io,
-            .socket_path = socket_path,
+            .address = addr,
             .ticket = try gpa.dupe(u8, ticket),
             .sink = sink,
         };
@@ -102,6 +105,7 @@ pub const Stream = struct {
         self.pending.deinit(self.gpa);
         self.draining.deinit(self.gpa);
         self.gpa.free(self.ticket);
+        self.gpa.free(self.address);
         self.gpa.destroy(self);
     }
 
@@ -112,7 +116,12 @@ pub const Stream = struct {
         var end: End = .{};
         defer self.postEnded(end);
 
-        const dc = data.DataConn.open(self.gpa, self.io, .{ .unix = self.socket_path }, self.ticket, data.terminal_subprotocol) catch |err| {
+        const candidates = core.endpoint.parse(self.address) catch |err| {
+            log.warn("bad data address {s}: {}", .{ self.address, err });
+            end.open_failed = true;
+            return;
+        };
+        const dc = data.DataConn.open(self.gpa, self.io, candidates.buf[0], self.ticket, data.terminal_subprotocol) catch |err| {
             log.warn("opening data connection failed: {}", .{err});
             end.open_failed = true;
             return;

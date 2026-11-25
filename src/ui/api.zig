@@ -87,6 +87,21 @@ pub const Bootstrap = struct {
     selected_session: ?Attached = null,
     attached_sessions: ?[]const Attached = null,
     data_tickets: ?[]const Ticket = null,
+    attach_all: ?SessionList = null,
+    server_status: ?struct { host_id: ?[]const u8 = null } = null,
+};
+
+/// `hosts.list`: the other Rex servers the user connects to.
+pub const Hosts = struct {
+    hosts: ?[]const Host = null,
+
+    pub const Host = struct {
+        id: []const u8 = "",
+        label: []const u8,
+        endpoints: ?[]const []const u8 = null,
+        icon: ?[]const u8 = null,
+        host_id: ?[]const u8 = null,
+    };
 };
 
 pub const SessionEvent = struct {

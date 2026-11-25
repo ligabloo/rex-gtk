@@ -147,6 +147,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(keymap_tests).step);
+    const settings_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/ui/settings_file.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(settings_tests).step);
 }
 
 /// The Ghostty source files the font stack and the OpenGL renderer need,

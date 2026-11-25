@@ -1,6 +1,6 @@
 //! rex-gtk: a GTK client for Rex.
 //!
-//!   rex-gtk [--session ID|LABEL] [--font FAMILY] [--font-size POINTS] [--label LABEL]
+//!   rex-gtk [--session [HOST:]ID|LABEL] [--font FAMILY] [--font-size POINTS] [--label LABEL]
 
 const std = @import("std");
 const core = @import("core");
@@ -9,7 +9,7 @@ const app_mod = @import("ui/app.zig");
 const App = app_mod.App;
 
 const usage =
-    \\usage: rex-gtk [--session ID|LABEL] [--font FAMILY] [--font-size POINTS] [--label LABEL]
+    \\usage: rex-gtk [--session [HOST:]ID|LABEL] [--font FAMILY] [--font-size POINTS] [--label LABEL]
     \\
 ;
 
@@ -45,10 +45,33 @@ pub fn main(init: std.process.Init) !u8 {
     var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     if (options.label == null) options.label = std.posix.gethostname(&host_buf) catch null;
 
-    const socket_path = try core.control.defaultSocketPath(gpa, init.environ_map);
+    // This computer's server: REX_SERVER if set, as the rex CLI does.
+    const env = init.environ_map;
+    const socket_path = try core.control.defaultSocketPath(gpa, env);
     defer gpa.free(socket_path);
+    const local_address = if (env.get("REX_SERVER")) |s|
+        try gpa.dupe(u8, s)
+    else
+        try std.fmt.allocPrint(gpa, "unix://{s}", .{socket_path});
+    defer gpa.free(local_address);
 
-    const app = try App.create(gpa, io, socket_path, options);
+    const config_home: ?[]u8 = if (env.get("XDG_CONFIG_HOME")) |c|
+        try gpa.dupe(u8, c)
+    else if (env.get("HOME")) |h|
+        try std.fs.path.join(gpa, &.{ h, ".config" })
+    else
+        null;
+    defer if (config_home) |c| gpa.free(c);
+
+    const app = try App.create(gpa, io, .{
+        .local_address = local_address,
+        .config_home = config_home,
+        .ssh_env = .{
+            .ssh_auth_sock = env.get("SSH_AUTH_SOCK"),
+            .xdg_runtime_dir = env.get("XDG_RUNTIME_DIR"),
+            .home = env.get("HOME"),
+        },
+    }, options);
     defer app.destroy();
     return app.run();
 }
