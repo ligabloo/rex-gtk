@@ -42,6 +42,8 @@ pub const Services = struct {
     dark: bool = true,
     /// For desktop notifications.
     app: ?*@import("gio").Application = null,
+    /// rex-gtk's settings, such as what the bell does.
+    settings: ?*@import("settings.zig").Settings = null,
     /// Asked to show the pane menu at a point in the pane.
     context_menu: ?struct {
         ctx: *anyopaque,

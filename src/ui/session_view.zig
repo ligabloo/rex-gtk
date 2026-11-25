@@ -665,9 +665,12 @@ pub const SessionView = struct {
             const p = api.parseValue(struct { title: []const u8 = "" }, msg, payload) orelse return;
             if (b.pane) |pane| pane.setTitle(p.title);
         } else if (std.mem.eql(u8, name, "bell")) {
+            const settings = self.services.settings;
+            const mark = if (settings) |s| s.getBool("bell.mark_tab", true) else true;
+            const sound = if (settings) |s| s.getBool("bell.sound", false) else false;
             const tab = self.tabShowing(b) orelse return;
-            if (self.selectedTab() != tab) tab.page.setNeedsAttention(1);
-            if (b.pane) |pane| pane.widgetPtr().errorBell();
+            if (mark and self.selectedTab() != tab) tab.page.setNeedsAttention(1);
+            if (sound) if (b.pane) |pane| pane.widgetPtr().errorBell();
         } else if (std.mem.eql(u8, name, "pwd_changed")) {
             const p = api.parseValue(struct { pwd: []const u8 = "" }, msg, payload) orelse return;
             if (b.pane) |pane| pane.setPwd(p.pwd);
@@ -684,6 +687,7 @@ pub const SessionView = struct {
             }
         } else if (std.mem.eql(u8, name, "desktop_notification")) {
             const p = api.parseValue(struct { title: []const u8 = "", body: []const u8 = "" }, msg, payload) orelse return;
+            if (self.services.settings) |s| if (!s.getBool("notify.terminal", true)) return;
             self.notify(p.title, p.body);
         } else {
             log.debug("block event {s} for {s}", .{ name, block_id });

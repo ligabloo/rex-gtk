@@ -19,6 +19,47 @@ pub const Window = struct {
     window_id: []u8,
     label: []u8,
     focused_block_id: ?[]u8,
+    /// Every block the window shows, for its activity.
+    blocks: [][]u8 = &.{},
+};
+
+/// What programs in a terminal say they're doing (OSC 7501), most urgent
+/// last: a tab shows the most urgent of its blocks.
+pub const Activity = enum(u8) {
+    idle,
+    done,
+    working,
+    @"error",
+    blocked,
+
+    pub fn parse(text: []const u8) Activity {
+        return std.meta.stringToEnum(Activity, text) orelse .idle;
+    }
+};
+
+/// One status record a program reported.
+pub const Record = struct {
+    id: []u8,
+    state: Activity,
+    /// The program, such as claude or cargo.
+    app: ?[]u8 = null,
+    /// What it says it's doing, as plain text.
+    text: ?[]u8 = null,
+};
+
+/// The most urgent state among some records, with the record's details.
+pub const Summary = struct {
+    state: Activity = .idle,
+    app: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+
+    fn merge(self: *Summary, r: Record) void {
+        if (@intFromEnum(r.state) > @intFromEnum(self.state) or (self.app == null and r.app != null and r.state == self.state)) {
+            self.state = r.state;
+            self.app = r.app orelse self.app;
+            self.text = r.text;
+        }
+    }
 };
 
 pub const Session = struct {
@@ -36,6 +77,14 @@ pub const BlockInfo = struct {
     /// The working directory as a path, decoded from file:// URLs.
     pwd: ?[]u8 = null,
     asked: bool = false,
+    asked_status: bool = false,
+    records: std.ArrayList(Record) = .empty,
+
+    pub fn summary(self: *const BlockInfo) Summary {
+        var out: Summary = .{};
+        for (self.records.items) |r| out.merge(r);
+        return out;
+    }
 };
 
 pub const Overview = struct {
@@ -45,6 +94,12 @@ pub const Overview = struct {
     blocks: std.StringHashMapUnmanaged(BlockInfo) = .empty,
     /// Called after anything the sidebar shows changed.
     changed: ?struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, m: *Machine) void } = null,
+    /// Called when a block's activity changes, such as a program becoming
+    /// blocked on a question.
+    activity: ?struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, m: *Machine, session_id: []const u8, window_id: []const u8, before: Activity, now: Summary) void,
+    } = null,
 
     pub fn init(gpa: Allocator, machine: *Machine) Overview {
         return .{ .gpa = gpa, .machine = machine };
@@ -81,6 +136,8 @@ pub const Overview = struct {
             self.gpa.free(w.window_id);
             self.gpa.free(w.label);
             if (w.focused_block_id) |b| self.gpa.free(b);
+            for (w.blocks) |b| self.gpa.free(b);
+            self.gpa.free(w.blocks);
         }
         s.windows.clearRetainingCapacity();
     }
@@ -88,6 +145,26 @@ pub const Overview = struct {
     fn freeInfo(gpa: Allocator, info: *BlockInfo) void {
         if (info.title) |t| gpa.free(t);
         if (info.pwd) |p| gpa.free(p);
+        for (info.records.items) |r| freeRecord(gpa, r);
+        info.records.deinit(gpa);
+    }
+
+    fn freeRecord(gpa: Allocator, r: Record) void {
+        gpa.free(r.id);
+        if (r.app) |a| gpa.free(a);
+        if (r.text) |t| gpa.free(t);
+    }
+
+    /// The most urgent activity among a window's blocks.
+    pub fn windowSummary(self: *const Overview, w: Window) Summary {
+        var out: Summary = .{};
+        for (w.blocks) |b| if (self.blocks.getPtr(b)) |info| {
+            const s = info.summary();
+            if (@intFromEnum(s.state) > @intFromEnum(out.state) or (out.app == null and s.app != null)) {
+                if (@intFromEnum(s.state) >= @intFromEnum(out.state)) out = s else out.app = s.app;
+            }
+        };
+        return out;
     }
 
     fn notify(self: *Overview) void {
@@ -186,13 +263,20 @@ pub const Overview = struct {
         s.active_window_id = if (view.active_window_id) |a| self.gpa.dupe(u8, a) catch null else null;
         for (view.windows orelse &.{}) |w| {
             const id = w.window_id;
+            var blocks: std.ArrayList([]u8) = .empty;
+            for (w.layers orelse &.{}) |layer| for (layer.blocks orelse &.{}) |b| {
+                const bid = b.block_id;
+                blocks.append(self.gpa, self.gpa.dupe(u8, bid) catch continue) catch {};
+            };
             const win: Window = .{
                 .window_id = self.gpa.dupe(u8, id) catch continue,
                 .label = self.gpa.dupe(u8, w.label orelse "") catch continue,
                 .focused_block_id = if (w.focused_block_id) |b| self.gpa.dupe(u8, b) catch null else null,
+                .blocks = blocks.toOwnedSlice(self.gpa) catch &.{},
             };
             s.windows.append(self.gpa, win) catch continue;
             if (win.focused_block_id) |b| self.learnBlock(s.session_id, b);
+            for (win.blocks) |b| self.learnStatus(s.session_id, b);
         }
         self.notify();
     }
@@ -214,6 +298,98 @@ pub const Overview = struct {
         entry.value_ptr.asked = true;
         self.askBlock(session_id, entry.key_ptr.*, "com.superlogical.terminal.title", &onTitle);
         self.askBlock(session_id, entry.key_ptr.*, "com.superlogical.terminal.pwd", &onPwd);
+    }
+
+    /// Ask for what a block's programs last reported, once.
+    fn learnStatus(self: *Overview, session_id: []const u8, block_id: []const u8) void {
+        const info = self.infoFor(block_id) orelse return;
+        if (info.asked_status) return;
+        info.asked_status = true;
+        const key = self.blocks.getKey(block_id).?;
+        self.askBlock(session_id, key, "com.superlogical.terminal.program_status", &onStatus);
+    }
+
+    fn infoFor(self: *Overview, block_id: []const u8) ?*BlockInfo {
+        const entry = self.blocks.getOrPut(self.gpa, block_id) catch return null;
+        if (!entry.found_existing) {
+            entry.key_ptr.* = self.gpa.dupe(u8, block_id) catch {
+                self.blocks.removeByPtr(entry.key_ptr);
+                return null;
+            };
+            entry.value_ptr.* = .{};
+        }
+        return entry.value_ptr;
+    }
+
+    const RecordJson = struct {
+        id: ?[]const u8 = null,
+        state: []const u8 = "idle",
+        app: ?[]const u8 = null,
+        effective_app: ?[]const u8 = null,
+        title: ?[]const u8 = null,
+        msg: ?[]const u8 = null,
+    };
+
+    fn onStatus(ctx: ?*anyopaque, maybe_msg: ?Incoming) void {
+        const req: *BlockReq = @ptrCast(@alignCast(ctx.?));
+        defer finishReq(req);
+        const msg = maybe_msg orelse return;
+        defer msg.deinit();
+        if (msg.kind.response.err != null) return;
+        const res = api.parse(struct { records: ?[]const RecordJson = null }, msg) orelse return;
+        for (res.records orelse &.{}) |r| req.ov.putRecord(req.block_id, r.id orelse "", r);
+    }
+
+    /// Store a record, and tell the listener if the block's state changed.
+    fn putRecord(self: *Overview, block_id: []const u8, id: []const u8, r: RecordJson) void {
+        const info = self.infoFor(block_id) orelse return;
+        const before = info.summary().state;
+        const gpa = self.gpa;
+        const text = r.msg orelse r.title;
+        const record: Record = .{
+            .id = gpa.dupe(u8, id) catch return,
+            .state = Activity.parse(r.state),
+            .app = if (r.effective_app orelse r.app) |a| gpa.dupe(u8, a) catch null else null,
+            .text = if (text) |t| gpa.dupe(u8, t) catch null else null,
+        };
+        const existing = for (info.records.items) |*old| {
+            if (std.mem.eql(u8, old.id, id)) break old;
+        } else null;
+        if (existing) |old| {
+            freeRecord(gpa, old.*);
+            old.* = record;
+        } else {
+            info.records.append(gpa, record) catch freeRecord(gpa, record);
+        }
+        self.activityChanged(block_id, before, info);
+    }
+
+    fn removeRecords(self: *Overview, block_id: []const u8, ids: []const []const u8) void {
+        const info = self.blocks.getPtr(block_id) orelse return;
+        const before = info.summary().state;
+        var i: usize = 0;
+        while (i < info.records.items.len) {
+            const r = info.records.items[i];
+            const gone = for (ids) |id| {
+                if (std.mem.eql(u8, id, r.id)) break true;
+            } else false;
+            if (gone) {
+                freeRecord(self.gpa, r);
+                _ = info.records.orderedRemove(i);
+            } else i += 1;
+        }
+        self.activityChanged(block_id, before, info);
+    }
+
+    fn activityChanged(self: *Overview, block_id: []const u8, before: Activity, info: *BlockInfo) void {
+        const now = info.summary();
+        self.notify();
+        if (now.state == before) return;
+        const cb = self.activity orelse return;
+        // Find the tab the block is in.
+        for (self.sessions.items) |s| for (s.windows.items) |w| for (w.blocks) |b| {
+            if (std.mem.eql(u8, b, block_id)) return cb.func(cb.ctx, self.machine, s.session_id, w.window_id, before, now);
+        };
     }
 
     const BlockReq = struct { ov: *Overview, block_id: []u8 };
@@ -294,6 +470,12 @@ pub const Overview = struct {
             } else if (eq(u8, p.name, "pwd_changed")) {
                 const d = api.parseValue(struct { pwd: []const u8 = "" }, msg, p.payload) orelse return;
                 self.setPwd(p.block_id, d.pwd);
+            } else if (eq(u8, p.name, "program_status_changed")) {
+                const d = api.parseValue(struct { id: []const u8 = "", record: RecordJson = .{} }, msg, p.payload) orelse return;
+                self.putRecord(p.block_id, d.id, d.record);
+            } else if (eq(u8, p.name, "program_status_removed")) {
+                const d = api.parseValue(struct { ids: []const []const u8 = &.{} }, msg, p.payload) orelse return;
+                self.removeRecords(p.block_id, d.ids);
             }
         }
     }

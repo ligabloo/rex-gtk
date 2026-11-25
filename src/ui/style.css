@@ -35,3 +35,9 @@
     background-color: #5e5c64;
   }
 }
+
+/* A tab's activity mark: blocked, failed. */
+.activity-dot {
+  font-size: 10px;
+  margin-right: 4px;
+}

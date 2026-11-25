@@ -209,6 +209,9 @@ pub const App = struct {
         const rex_action = gio.SimpleAction.new("rex", glib.VariantType.new("s"));
         _ = gio.SimpleAction.signals.activate.connect(rex_action, *App, &onRexAction, self, .{});
         self.adw_app.as(gio.ActionMap).addAction(rex_action.as(gio.Action));
+        const show_tab = gio.SimpleAction.new("show-tab", glib.VariantType.new("(sss)"));
+        _ = gio.SimpleAction.signals.activate.connect(show_tab, *App, &onShowTab, self, .{});
+        self.adw_app.as(gio.ActionMap).addAction(show_tab.as(gio.Action));
     }
 
     /// The pane menu, from a right click: as in Rex.app, this is where the
@@ -480,6 +483,7 @@ pub const App = struct {
             .app = self.adw_app.as(gio.Application),
             .shortcut = .{ .ctx = self, .func = onShortcut },
             .context_menu = .{ .ctx = self, .func = onContextMenu },
+            .settings = &self.settings,
         };
         _ = gobject.Object.signals.notify.connect(
             self.adw_app.getStyleManager(),
@@ -524,6 +528,78 @@ pub const App = struct {
     /// Hear about a machine's tabs as well as its connection.
     fn watch(self: *App, m: *Machine) void {
         m.overview.changed = .{ .ctx = self, .func = onOverviewChanged };
+        m.overview.activity = .{ .ctx = self, .func = onActivity };
+    }
+
+    /// A tab's program became blocked, finished or failed: tell the user if
+    /// they aren't looking at it.
+    fn onActivity(ctx: *anyopaque, m: *Machine, session_id: []const u8, window_id: []const u8, before: overview.Activity, now: overview.Summary) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const app = self.adw_app.as(gio.Application);
+        var id_buf: [160]u8 = undefined;
+        const id = std.fmt.bufPrintSentinel(&id_buf, "activity-{s}", .{window_id}, 0) catch return;
+        _ = before;
+        const key, const verb = switch (now.state) {
+            .blocked => .{ "notify.blocked", "needs your input" },
+            .done => .{ "notify.done", "finished" },
+            .@"error" => .{ "notify.error", "failed" },
+            .idle, .working => {
+                app.withdrawNotification(id);
+                return;
+            },
+        };
+        if (!self.settings.getBool(key, true)) return;
+        // Looking at it already.
+        const shown = if (self.view) |v| v.machine == m and std.mem.eql(u8, v.session_id, session_id) and
+            if (v.selectedTab()) |t| std.mem.eql(u8, t.window_id, window_id) else false
+        else
+            false;
+        if (shown and self.windowActive()) return;
+
+        const who = now.app orelse self.tabName(m, session_id, window_id);
+        var tbuf: [256]u8 = undefined;
+        var bbuf: [512]u8 = undefined;
+        const n = gio.Notification.new(std.fmt.bufPrintSentinel(&tbuf, "{s} {s}", .{ who, verb }, 0) catch "A program needs you");
+        defer n.as(gobject.Object).unref();
+        const session_name = for (m.sessions.items) |s| {
+            if (std.mem.eql(u8, s.session_id, session_id)) break if (s.label.len > 0) s.label else s.session_id;
+        } else session_id;
+        const body = if (now.text) |t|
+            std.fmt.bufPrintSentinel(&bbuf, "{s}\n{s} · {s}", .{ t, session_name, m.title() }, 0) catch ""
+        else
+            std.fmt.bufPrintSentinel(&bbuf, "{s} · {s}", .{ session_name, m.title() }, 0) catch "";
+        n.setBody(body);
+        if (now.state == .blocked) n.setPriority(.high);
+        var target_buf: [3][256]u8 = undefined;
+        const target = glib.Variant.newTuple(&[_]*glib.Variant{
+            glib.Variant.newString(std.fmt.bufPrintSentinel(&target_buf[0], "{s}", .{m.id}, 0) catch ""),
+            glib.Variant.newString(std.fmt.bufPrintSentinel(&target_buf[1], "{s}", .{session_id}, 0) catch ""),
+            glib.Variant.newString(std.fmt.bufPrintSentinel(&target_buf[2], "{s}", .{window_id}, 0) catch ""),
+        }, 3);
+        n.setDefaultActionAndTargetValue("app.show-tab", target);
+        app.sendNotification(id, n);
+    }
+
+    /// A tab's name, as the sidebar shows it.
+    fn tabName(_: *App, m: *Machine, session_id: []const u8, window_id: []const u8) []const u8 {
+        const s = m.overview.session(session_id) orelse return "A program";
+        for (s.windows.items) |w| if (std.mem.eql(u8, w.window_id, window_id)) {
+            const block = if (w.focused_block_id) |b| m.overview.block(b) else null;
+            return overview.tabTitle(w.label, if (block) |b| b.title else null);
+        };
+        return "A program";
+    }
+
+    /// From a notification: show that tab and bring the window up.
+    fn onShowTab(_: *gio.SimpleAction, param: ?*glib.Variant, self: *App) callconv(.c) void {
+        const p = param orelse return;
+        var mid: ?[*:0]const u8 = null;
+        var sid: ?[*:0]const u8 = null;
+        var wid: ?[*:0]const u8 = null;
+        p.get("(&s&s&s)", &mid, &sid, &wid);
+        const m = self.machineById(std.mem.span(mid orelse return)) orelse return;
+        self.showTab(m, std.mem.span(sid orelse return), std.mem.span(wid orelse return));
+        if (self.window) |w| w.as(gtk.Window).present();
     }
 
     fn onOverviewChanged(ctx: *anyopaque, m: *Machine) void {

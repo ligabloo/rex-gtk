@@ -140,6 +140,7 @@ pub const Sidebar = struct {
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
 
+        const show_activity = self.app.settings.getBool("sidebar.activity", true);
         for (self.app.machines.items) |m| {
             self.append(self.machineRow(m), .{
                 .kind = .machine,
@@ -163,9 +164,15 @@ pub const Sidebar = struct {
                     var tbuf: [std.fs.max_path_bytes]u8 = undefined;
                     const home = if (m.is_local) self.app.startup.ssh_env.home else null;
                     const pwd = if (block) |b| if (b.pwd) |p| ov.tildePath(&tbuf, p, home) else "" else "";
-                    const hay = std.fmt.allocPrint(a, "{s} {s} {s}", .{ title, pwd, name }) catch continue;
+                    const activity: ov.Summary = if (show_activity) m.overview.windowSummary(w) else .{};
+                    // While a program says what it's doing, show that.
+                    const detail = switch (activity.state) {
+                        .working, .blocked, .@"error" => activity.text orelse pwd,
+                        else => pwd,
+                    };
+                    const hay = std.fmt.allocPrint(a, "{s} {s} {s}", .{ title, detail, name }) catch continue;
                     _ = std.ascii.lowerString(hay, hay);
-                    self.append(tabRow(title, pwd), .{
+                    self.append(tabRow(title, detail, activity), .{
                         .kind = .tab,
                         .machine = m,
                         .session_id = sid,
@@ -243,7 +250,7 @@ pub const Sidebar = struct {
         return row;
     }
 
-    fn tabRow(title: []const u8, detail: []const u8) *gtk.ListBoxRow {
+    fn tabRow(title: []const u8, detail: []const u8, activity: ov.Summary) *gtk.ListBoxRow {
         const row = gtk.ListBoxRow.new();
         row.as(gtk.Widget).addCssClass("tab-row");
         const box = gtk.Box.new(.horizontal, 10);
@@ -251,6 +258,13 @@ pub const Sidebar = struct {
         const tile = gtk.Image.newFromIconName("utilities-terminal-symbolic");
         tile.as(gtk.Widget).addCssClass("tab-tile");
         tile.as(gtk.Widget).setValign(.center);
+        // Agents and other programs that report their status get a tile of
+        // their own.
+        if (activity.app) |app| {
+            tile.as(gtk.Widget).addCssClass("agent");
+            var tip: [128]u8 = undefined;
+            tile.as(gtk.Widget).setTooltipText(std.fmt.bufPrintSentinel(&tip, "{s}", .{app}, 0) catch "");
+        }
         box.append(tile.as(gtk.Widget));
 
         const text = gtk.Box.new(.vertical, 0);
@@ -270,8 +284,40 @@ pub const Sidebar = struct {
             text.append(d.as(gtk.Widget));
         }
         box.append(text.as(gtk.Widget));
+        if (activityMark(activity.state)) |mark| box.append(mark);
         row.setChild(box.as(gtk.Widget));
         return row;
+    }
+
+    /// What a tab's programs are doing, at the end of its row.
+    fn activityMark(state: ov.Activity) ?*gtk.Widget {
+        const dot = struct {
+            fn make(class: [:0]const u8, tip: [:0]const u8) *gtk.Widget {
+                const l = gtk.Label.new("●");
+                l.as(gtk.Widget).addCssClass(class);
+                l.as(gtk.Widget).addCssClass("activity-dot");
+                l.as(gtk.Widget).setTooltipText(tip);
+                l.as(gtk.Widget).setValign(.center);
+                return l.as(gtk.Widget);
+            }
+        }.make;
+        switch (state) {
+            .idle => return null,
+            .working => {
+                const s = adw.Spinner.new();
+                s.as(gtk.Widget).setTooltipText("Working");
+                s.as(gtk.Widget).setValign(.center);
+                return s.as(gtk.Widget);
+            },
+            .blocked => return dot("accent", "Waiting for you"),
+            .@"error" => return dot("error", "Failed"),
+            .done => {
+                const i = gtk.Image.newFromIconName("object-select-symbolic");
+                i.as(gtk.Widget).addCssClass("success");
+                i.as(gtk.Widget).setTooltipText("Done");
+                return i.as(gtk.Widget);
+            },
+        }
     }
 
     fn onNewSession(_: *gtk.Button, m: *Machine) callconv(.c) void {
