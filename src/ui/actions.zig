@@ -92,7 +92,7 @@ pub const all = [_]Action{
     .{ .name = "pane.reset", .title = "Reset Terminal", .category = "Panes" },
     .{ .name = "pane.menu", .title = "Show Pane Menu", .category = "Panes" },
     .{ .name = "client.preferences", .title = "Preferences", .category = "Window", .args =
-    \\{"type":"object","properties":{"page":{"enum":["server","general","machines","appearance"],"type":"string","description":"The page to show."},"machine":{"type":"string","description":"On the Machines page, the machine whose details to show, by name."}}}
+    \\{"type":"object","properties":{"page":{"enum":["server","general","machines","appearance","themes","terminal","shortcuts","notifications"],"type":"string","description":"The page to show."},"machine":{"type":"string","description":"On the Machines page, the machine whose details to show, by name."}}}
     },
 };
 
@@ -139,7 +139,7 @@ pub fn perform(app: *App, name: []const u8, args: std.json.Value) Error!void {
     }
     if (eq(u8, name, "client.font.increase")) return app.setFontSize(app.font_size + 1);
     if (eq(u8, name, "client.font.decrease")) return app.setFontSize(@max(4, app.font_size - 1));
-    if (eq(u8, name, "client.font.reset")) return app.setFontSize(app.options.font_size);
+    if (eq(u8, name, "client.font.reset")) return app.setFontSize(app.defaultFontSize());
     if (eq(u8, name, "session.new")) return newSession(app);
     if (eq(u8, name, "session.select")) {
         const id = argString(args, "session_id") orelse return error.BadArgs;

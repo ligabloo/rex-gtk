@@ -14,14 +14,19 @@ const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 const App = @import("../app.zig").App;
+const Settings = @import("../settings.zig").Settings;
 const ServerPage = @import("server.zig").ServerPage;
 const GeneralPage = @import("general.zig").GeneralPage;
 const MachinesPage = @import("machines.zig").MachinesPage;
 const AppearancePage = @import("appearance.zig").AppearancePage;
+const ThemesPage = @import("themes.zig").ThemesPage;
+const TerminalPage = @import("terminal.zig").TerminalPage;
+const ShortcutsPage = @import("shortcuts.zig").ShortcutsPage;
+const NotificationsPage = @import("notifications.zig").NotificationsPage;
 
 const log = std.log.scoped(.prefs);
 
-pub const PageId = enum { server, general, machines, appearance };
+pub const PageId = enum { server, general, machines, appearance, themes, terminal, shortcuts, notifications };
 
 const PageInfo = struct {
     id: PageId,
@@ -35,7 +40,11 @@ const pages = [_]PageInfo{
     .{ .id = .server, .title = "Server", .icon = "network-server-symbolic", .keywords = "status stop restart connections address tailscale tailnet pair device qr sign in account control configuration init.lua reload" },
     .{ .id = .general, .title = "General", .icon = "preferences-system-symbolic", .keywords = "client name label remote control startup session open start server" },
     .{ .id = .machines, .title = "Machines", .icon = "computer-symbolic", .keywords = "hosts remote ssh agent keys add machine address check" },
-    .{ .id = .appearance, .title = "Appearance", .icon = "applications-graphics-symbolic", .keywords = "tabs layout sidebar header bar hide hover" },
+    .{ .id = .appearance, .title = "Appearance", .icon = "applications-graphics-symbolic", .keywords = "style light dark tabs layout sidebar header bar hide hover dim panes activity" },
+    .{ .id = .themes, .title = "Themes", .icon = "color-select-symbolic", .keywords = "colors palette light dark solarized gruvbox catppuccin tokyo nord" },
+    .{ .id = .terminal, .title = "Terminal", .icon = "utilities-terminal-symbolic", .keywords = "font size selection copy scroll wheel" },
+    .{ .id = .shortcuts, .title = "Shortcuts", .icon = "preferences-desktop-keyboard-shortcuts-symbolic", .keywords = "keys bindings keyboard keymap" },
+    .{ .id = .notifications, .title = "Notifications", .icon = "preferences-system-notifications-symbolic", .keywords = "bell sound alert notify blocked done failed osc" },
 };
 
 pub const Prefs = struct {
@@ -55,6 +64,10 @@ pub const Prefs = struct {
     general: *GeneralPage,
     machines: *MachinesPage,
     appearance: *AppearancePage,
+    themes: *ThemesPage,
+    terminal: *TerminalPage,
+    shortcuts: *ShortcutsPage,
+    notifications: *NotificationsPage,
     current: PageId = .server,
     closed_handler: c_ulong = 0,
 
@@ -125,6 +138,10 @@ pub const Prefs = struct {
             .general = undefined,
             .machines = undefined,
             .appearance = undefined,
+            .themes = undefined,
+            .terminal = undefined,
+            .shortcuts = undefined,
+            .notifications = undefined,
         };
 
         // The page list. The Server row ends with a dot for its state.
@@ -157,6 +174,10 @@ pub const Prefs = struct {
         self.machines = try MachinesPage.create(self);
         errdefer self.machines.destroy();
         self.appearance = try AppearancePage.create(self);
+        self.themes = try ThemesPage.create(self);
+        self.terminal = try TerminalPage.create(self);
+        self.shortcuts = try ShortcutsPage.create(self);
+        self.notifications = try NotificationsPage.create(self);
 
         self.closed_handler = adw.Dialog.signals.closed.connect(dialog, *Prefs, &onClosed, self, .{});
         list.selectRow(list.getRowAtIndex(0));
@@ -181,6 +202,10 @@ pub const Prefs = struct {
         self.general.destroy();
         self.machines.destroy();
         self.appearance.destroy();
+        self.themes.destroy();
+        self.terminal.destroy();
+        self.shortcuts.destroy();
+        self.notifications.destroy();
         self.gpa.destroy(self);
     }
 
@@ -199,6 +224,10 @@ pub const Prefs = struct {
             .general => self.general.page,
             .machines => self.machines.page,
             .appearance => self.appearance.page,
+            .themes => self.themes.page,
+            .terminal => self.terminal.page,
+            .shortcuts => self.shortcuts.page,
+            .notifications => self.notifications.page,
         };
         var list = [_]*adw.NavigationPage{page};
         self.nav.replace(&list, 1);
@@ -262,6 +291,7 @@ pub const Prefs = struct {
 
     pub fn serverChanged(self: *Prefs) void {
         self.server.scheduleRefresh();
+        self.shortcuts.scheduleRefresh();
         self.updateStatusDot();
     }
 
@@ -449,4 +479,21 @@ pub fn openUri(prefs: *Prefs, uri: []const u8) void {
     defer launcher.as(gobject.Object).unref();
     const window = if (prefs.app.window) |w| w.as(gtk.Window) else null;
     launcher.launch(window, null, null, null);
+}
+
+pub fn switchRow(title: [:0]const u8, subtitle: ?[:0]const u8, active: bool) *adw.SwitchRow {
+    const row = adw.SwitchRow.new();
+    row.as(adw.PreferencesRow).setTitle(title);
+    if (subtitle) |t| row.as(adw.ActionRow).setSubtitle(t);
+    row.setActive(@intFromBool(active));
+    return row;
+}
+
+/// Keep a boolean setting in step with a switch.
+pub fn bindSwitch(row: *adw.SwitchRow, settings: *Settings, comptime key: []const u8) void {
+    _ = gobject.Object.signals.notify.connect(row, *Settings, &struct {
+        fn f(r: *adw.SwitchRow, _: *gobject.ParamSpec, s: *Settings) callconv(.c) void {
+            s.setBool(key, r.getActive() != 0);
+        }
+    }.f, settings, .{ .detail = "active" });
 }

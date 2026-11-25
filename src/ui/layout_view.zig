@@ -62,6 +62,8 @@ pub const LayoutWidget = extern struct {
     const State = struct {
         placements: std.ArrayList(Placement) = .empty,
         dark: bool = true,
+        /// Whether unfocused blocks are drawn dimmed at all.
+        dim_enabled: bool = true,
         dividers: std.ArrayList(Divider) = .empty,
         on_resize: ?struct { ctx: *anyopaque, func: ResizeFn } = null,
         /// The divider being dragged, and where the drag started.
@@ -114,6 +116,14 @@ pub const LayoutWidget = extern struct {
         motion.as(gtk.EventController).setPropagationPhase(.capture);
         _ = gtk.EventControllerMotion.signals.motion.connect(motion, *LayoutWidget, &onMotion, self, .{});
         me.addController(motion.as(gtk.EventController));
+    }
+
+    /// Turn dimming of unfocused blocks on or off.
+    pub fn setDimEnabled(self: *LayoutWidget, on: bool) void {
+        const state = self.state orelse return;
+        if (state.dim_enabled == on) return;
+        state.dim_enabled = on;
+        self.as(gtk.Widget).queueDraw();
     }
 
     /// Show these blocks, in drawing order (back to front). Widgets that are
@@ -323,7 +333,7 @@ pub const LayoutWidget = extern struct {
             var r: graphene.Rect = undefined;
             _ = r.init(p.px.x, p.px.y, p.px.w, p.px.h);
             me.snapshotChild(p.widget, snap);
-            if (p.dim) snap.appendColor(&shade, &r);
+            if (p.dim and state.dim_enabled) snap.appendColor(&shade, &r);
             if (p.kind == .floating) {
                 var outline: gsk.RoundedRect = undefined;
                 var outer: graphene.Rect = undefined;

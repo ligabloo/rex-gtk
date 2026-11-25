@@ -56,17 +56,6 @@ pub const Services = struct {
     } = null,
 };
 
-const Theme = struct {
-    foreground: []const u8,
-    background: []const u8,
-    cursor: []const u8,
-    scheme: []const u8,
-};
-
-/// Libadwaita's view colors, so terminals sit naturally in the window.
-const dark_theme: Theme = .{ .foreground = "#ffffff", .background = "#1e1e1e", .cursor = "#ffffff", .scheme = "dark" };
-const light_theme: Theme = .{ .foreground = "#1e1e1e", .background = "#ffffff", .cursor = "#1e1e1e", .scheme = "light" };
-
 const blink_interval_ms = 600;
 
 pub const Pane = struct {
@@ -715,11 +704,33 @@ pub const Pane = struct {
     /// dark style. Applies while we own the block.
     pub fn pushTheme(self: *Pane) void {
         if (!self.owned) return;
-        const theme = if (self.services.dark) dark_theme else light_theme;
+        const themes = @import("themes.zig");
+        const dark = self.services.dark;
+        const settings = self.services.settings;
+        // Leave the colors to the configuration file, if asked; just say
+        // whether it's light or dark.
+        if (settings) |s| if (s.getBool("theme.use_config", false)) {
+            return self.machine.send("com.superlogical.terminal.set_theme", .{
+                .session_id = self.session_id,
+                .block_id = self.block_id,
+                .args = .{ .scheme = if (dark) "dark" else "light" },
+            });
+        };
+        const id = if (settings) |s| s.getString(if (dark) "theme.dark" else "theme.light", "") else "";
+        const t = themes.forMode(id, dark);
+        var buf: [16][12]u8 = undefined;
+        var palette: [16][]const u8 = undefined;
+        themes.paletteArgs(t, &buf, &palette);
         self.machine.send("com.superlogical.terminal.set_theme", .{
             .session_id = self.session_id,
             .block_id = self.block_id,
-            .args = theme,
+            .args = .{
+                .foreground = t.foreground,
+                .background = t.background,
+                .cursor = t.cursor,
+                .scheme = if (dark) "dark" else "light",
+                .palette = &palette,
+            },
         });
     }
 

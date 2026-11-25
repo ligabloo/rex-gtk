@@ -337,6 +337,7 @@ pub const SessionView = struct {
         const gpa = self.gpa;
         const tab = gpa.create(Tab) catch return null;
         const layout = LayoutWidget.new();
+        if (self.services.settings) |s| layout.setDimEnabled(s.getBool("panes.dim", true));
         tab.* = .{
             .window_id = gpa.dupe(u8, window_id) catch {
                 gpa.destroy(tab);
@@ -777,6 +778,11 @@ pub const SessionView = struct {
         const self: *SessionView = @ptrCast(@alignCast(ctx));
         if (self.blocks.get(pane.block_id) == null) return;
         self.requestTicket(pane.block_id);
+    }
+
+    /// Dim unfocused panes, or don't.
+    pub fn setDimEnabled(self: *SessionView, on: bool) void {
+        for (self.tabs.items) |tab| tab.layout.setDimEnabled(on);
     }
 
     /// Titles we take from the overview changed.

@@ -210,8 +210,11 @@ fn onReleased(click: *gtk.GestureClick, _: c_int, x: f64, y: f64, pane: *Pane) c
         st.selecting = false;
         stopAutoscroll(st);
         st.gesture.release(t, .{ .pin = pinAt(t, cell) });
-        // Selecting copies to the primary selection, as on X11.
+        // Selecting copies to the primary selection, as on X11, and to the
+        // clipboard too if asked.
         copyTo(pane, pane.widget.as(gtk.Widget).getPrimaryClipboard());
+        if (pane.services.settings) |s| if (s.getBool("terminal.copy_on_select", false))
+            copyTo(pane, pane.widget.as(gtk.Widget).getClipboard());
         return;
     }
     const was_held = switch (button) {
@@ -331,7 +334,8 @@ fn onScroll(ctrl: *gtk.EventControllerScroll, dx: f64, dy: f64, pane: *Pane) cal
     }
 
     // Otherwise scroll our own view of the scrollback.
-    const lines: f64 = if (unit == .wheel) dy * 3 else lines: {
+    const step: f64 = if (pane.services.settings) |s| s.getNumber("terminal.scroll_lines", 3) else 3;
+    const lines: f64 = if (unit == .wheel) dy * step else lines: {
         const cell_h: f64 = @as(f64, @floatFromInt(pane.services.fonts.cellSize().height)) / pane.widget.scale();
         st.scroll_rest += dy;
         const n = @trunc(st.scroll_rest / cell_h);

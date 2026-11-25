@@ -99,6 +99,19 @@ pub const Settings = struct {
         };
     }
 
+    pub fn getNumber(self: *const Settings, key: []const u8, default: f64) f64 {
+        return switch (self.values.get(key) orelse return default) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => default,
+        };
+    }
+
+    pub fn setNumber(self: *Settings, key: []const u8, value: f64) void {
+        if (self.values.get(key)) |old| if (old == .float and old.float == value) return;
+        self.put(key, .{ .float = value });
+    }
+
     pub fn setString(self: *Settings, key: []const u8, value: []const u8) void {
         if (std.mem.eql(u8, self.getString(key, ""), value) and self.values.contains(key)) return;
         const a = self.arena.allocator();

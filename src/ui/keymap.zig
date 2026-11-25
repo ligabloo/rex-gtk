@@ -248,6 +248,21 @@ pub fn gtkAccel(buf: []u8, spec: []const u8) ?[]const u8 {
     return w.buffered();
 }
 
+/// A binding's arguments as a few words, such as "1" for {"index":1} or
+/// "(last)" for {"index":-1}, to tell bindings of one action apart.
+pub fn argSummary(args: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, args, ':') orelse return "";
+    const rest = std.mem.trim(u8, args[colon + 1 ..], " }\"");
+    if (std.mem.eql(u8, rest, "-1")) return "(last)";
+    return rest;
+}
+
+test "argument summaries" {
+    try std.testing.expectEqualStrings("3", argSummary("{\"index\":3}"));
+    try std.testing.expectEqualStrings("(last)", argSummary("{\"index\":-1}"));
+    try std.testing.expectEqualStrings("left", argSummary("{\"direction\":\"left\"}"));
+}
+
 test "gtk accelerators" {
     const t = std.testing;
     var buf: [64]u8 = undefined;

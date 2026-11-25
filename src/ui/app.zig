@@ -36,7 +36,8 @@ pub const Options = struct {
     /// A session ID or label to show; otherwise the server picks one.
     session: ?[]const u8 = null,
     font_family: ?[:0]const u8 = null,
-    font_size: f32 = 11,
+    /// Set by --font-size; otherwise from the settings.
+    font_size: ?f32 = null,
     label: ?[]const u8 = null,
     /// Debugging: write every frame to this PNG path.
     dump_frame: ?[]const u8 = null,
@@ -79,8 +80,10 @@ pub const App = struct {
     header_ready: bool = false,
     split_view: ?*adw.OverlaySplitView = null,
 
-    /// The terminal font size in points; starts at `options.font_size`.
+    /// The terminal font size in points.
     font_size: f32 = 11,
+    /// The font family in use, or null for the built-in one. Owned.
+    font_family: ?[:0]u8 = null,
     /// Key bindings, sequences and modes.
     keys: Keys = undefined,
     /// Prompts from configuration file actions (rex.ui) being shown.
@@ -110,7 +113,6 @@ pub const App = struct {
             .startup = startup,
             .adw_app = adw.Application.new(app_id, .{ .non_unique = true }),
             .settings = try .load(gpa, io, startup.config_home),
-            .font_size = options.font_size,
         };
         self.keys = .init(gpa, self);
         self.prompts = .init(gpa, self);
@@ -296,7 +298,7 @@ pub const App = struct {
                     var abuf: [64]u8 = undefined;
                     // Bindings with arguments, such as alt+1 for the first tab.
                     const title = if (b.args) |a|
-                        std.fmt.bufPrintSentinel(&tbuf, "{s} {s}", .{ act.title, argSuffix(a) }, 0) catch continue
+                        std.fmt.bufPrintSentinel(&tbuf, "{s} {s}", .{ act.title, keymap.argSummary(a) }, 0) catch continue
                     else
                         std.fmt.bufPrintSentinel(&tbuf, "{s}", .{act.title}, 0) catch continue;
                     section.add(adw.ShortcutsItem.new(title, std.fmt.bufPrintSentinel(&abuf, "{s}", .{accel}, 0) catch continue));
@@ -306,15 +308,6 @@ pub const App = struct {
             if (any) dialog.add(section) else section.as(gobject.Object).refSink().as(gobject.Object).unref();
         }
         dialog.as(adw.Dialog).present(if (self.window) |w| w.as(gtk.Widget) else null);
-    }
-
-    /// A short note for a binding's arguments, such as "1" for {"index":1}.
-    fn argSuffix(args: []const u8) []const u8 {
-        // Show the first value: an index or a direction.
-        const colon = std.mem.indexOfScalar(u8, args, ':') orelse return "";
-        const rest = std.mem.trim(u8, args[colon + 1 ..], " }\"");
-        if (std.mem.eql(u8, rest, "-1")) return "(last)";
-        return rest;
     }
 
     pub fn startFilter(self: *App) void {
@@ -336,18 +329,38 @@ pub const App = struct {
 
     /// Change the terminal font size for every pane.
     pub fn setFontSize(self: *App, points: f32) void {
-        const services = if (self.services) |*s| s else return;
         if (points == self.font_size) return;
+        self.setFont(self.font_family, points);
+    }
+
+    /// The size to go back to: --font-size, else the setting.
+    pub fn defaultFontSize(self: *App) f32 {
+        return self.options.font_size orelse @floatCast(self.settings.getNumber("terminal.font_size", 11));
+    }
+
+    /// Change the terminal font for every pane. `family` null is the
+    /// built-in font.
+    pub fn setFont(self: *App, family: ?[]const u8, points: f32) void {
+        const family_z: ?[:0]u8 = if (family) |f| (if (f.len > 0) self.gpa.dupeSentinel(u8, f, 0) catch return else null) else null;
+        const services = if (self.services) |*s| s else {
+            if (self.font_family) |old| self.gpa.free(old);
+            self.font_family = family_z;
+            self.font_size = points;
+            return;
+        };
         const fonts = render.fonts.Fonts.create(self.gpa, .{
-            .family = self.options.font_family,
+            .family = family_z,
             .size_points = points,
             .dpi = @intFromFloat(96 * self.windowScale()),
         }) catch |err| {
             log.err("loading the font at {d}pt failed: {}", .{ points, err });
+            if (family_z) |f| self.gpa.free(f);
             return;
         };
         const old = services.fonts;
         services.fonts = fonts;
+        if (self.font_family) |f| if (family_z == null or f.ptr != family_z.?.ptr) self.gpa.free(f);
+        self.font_family = family_z;
         self.font_size = points;
         if (self.view) |v| v.fontsChanged();
         old.destroy();
@@ -398,6 +411,8 @@ pub const App = struct {
             s.fonts.destroy();
             s.gpu.destroy();
         }
+        if (self.font_family) |f| self.gpa.free(f);
+        self.font_family = null;
     }
 
     fn showStatus(self: *App, icon: [:0]const u8, title: [:0]const u8, description: ?[]const u8) void {
@@ -466,11 +481,16 @@ pub const App = struct {
         const gpu = try render.renderer.Gpu.create(self.gpa);
         errdefer gpu.destroy();
         gpu.release();
+        // --font and --font-size win over the settings, for this run.
+        const family = if (self.options.font_family) |f| f else self.settings.getString("terminal.font", "");
+        self.font_family = if (family.len > 0) try self.gpa.dupeSentinel(u8, family, 0) else null;
+        self.font_size = self.defaultFontSize();
         const fonts = try render.fonts.Fonts.create(self.gpa, .{
-            .family = self.options.font_family,
-            .size_points = self.options.font_size,
+            .family = self.font_family,
+            .size_points = self.font_size,
             .dpi = @intFromFloat(96 * self.windowScale()),
         });
+        self.applyColorScheme();
         errdefer fonts.destroy();
 
         self.services = .{
@@ -874,6 +894,19 @@ pub const App = struct {
             for (self.machines.items) |m| m.setClientLabel(label);
         } else if (eq(u8, key, "startup.start_server")) {
             self.localMachine().autostart = self.settings.getBool(key, true);
+        } else if (std.mem.startsWith(u8, key, "theme.")) {
+            if (self.view) |v| v.themeChanged();
+        } else if (eq(u8, key, "style.scheme")) {
+            self.applyColorScheme();
+        } else if (eq(u8, key, "panes.dim")) {
+            if (self.view) |v| v.setDimEnabled(self.settings.getBool(key, true));
+        } else if (eq(u8, key, "sidebar.activity")) {
+            self.rebuildSidebar();
+        } else if (eq(u8, key, "terminal.font") or eq(u8, key, "terminal.font_size")) {
+            if (self.options.font_family == null or self.options.font_size == null) {
+                const family = self.options.font_family orelse self.settings.getString("terminal.font", "");
+                self.setFont(family, self.defaultFontSize());
+            }
         } else if (eq(u8, key, "tabs.layout") or eq(u8, key, "header.behavior")) {
             if (self.header_ready) self.header.applySettings();
         } else if (eq(u8, key, "ssh.agent") or eq(u8, key, "ssh.agent_path")) {
@@ -981,6 +1014,18 @@ pub const App = struct {
         };
         if (self.statusMachine()) |m| if (m.state != .connected) return self.showMachineStatus(m);
         self.showStatus("utilities-terminal-symbolic", "No sessions", "Create one with `rex new`.");
+    }
+
+    /// Follow the system's light or dark style, or force one.
+    fn applyColorScheme(self: *App) void {
+        const scheme = self.settings.getString("style.scheme", "system");
+        const sm = self.adw_app.getStyleManager();
+        sm.setColorScheme(if (std.mem.eql(u8, scheme, "light"))
+            .force_light
+        else if (std.mem.eql(u8, scheme, "dark"))
+            .force_dark
+        else
+            .default);
     }
 
     fn onDarkChanged(sm: *adw.StyleManager, _: *gobject.ParamSpec, self: *App) callconv(.c) void {
