@@ -332,10 +332,7 @@ pub const SessionView = struct {
     }
 
     pub fn closeTab(self: *SessionView, tab: *const Tab) void {
-        self.machine.send("session.close_window", .{
-            .session_id = self.session_id,
-            .window_id = tab.window_id,
-        });
+        self.machine.closeWindow(self.session_id, tab.window_id);
     }
 
     fn findTab(self: *SessionView, window_id: []const u8) ?*Tab {

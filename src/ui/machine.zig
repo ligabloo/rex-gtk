@@ -190,6 +190,10 @@ pub const Machine = struct {
         if (self.client) |c| c.send(method, payload);
     }
 
+    pub fn closeWindow(self: *Machine, session_id: []const u8, window_id: []const u8) void {
+        self.send("session.close_window", .{ .session_id = session_id, .window_id = window_id });
+    }
+
     pub fn call(self: *Machine, method: []const u8, payload: anytype, ctx: ?*anyopaque, callback: ResponseFn) void {
         if (self.client) |c| return c.call(method, payload, ctx, callback);
         callback(ctx, null);

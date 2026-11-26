@@ -30,32 +30,17 @@
   opacity: 1;
 }
 
-/* Show New Session and New Tab when hovering their rows. */
-.rex-sidebar .row-create {
+/* Reveal row actions on hover or keyboard focus. */
+.rex-sidebar .row-create,
+.rex-sidebar .row-close {
   opacity: 0;
   transition: opacity 120ms ease;
 }
 .rex-sidebar row:hover .row-create,
-.rex-sidebar .row-create:focus-visible {
+.rex-sidebar .row-create:focus-visible,
+.rex-sidebar row:hover .row-close,
+.rex-sidebar .row-close:focus-visible {
   opacity: 1;
-}
-
-/* The tile beside a tab's name. */
-.tab-tile {
-  min-width: 24px;
-  min-height: 24px;
-  border-radius: 6px;
-  background-color: #3d3846;
-  color: white;
-  -gtk-icon-size: 14px;
-}
-.tab-tile.agent {
-  background-color: #c64600;
-}
-@media (prefers-color-scheme: dark) {
-  .tab-tile {
-    background-color: #5e5c64;
-  }
 }
 
 /* A tab's activity mark: blocked, failed. */

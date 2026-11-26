@@ -1,7 +1,7 @@
 //! The sidebar: every machine, its sessions, and each session's tabs, as
 //! in Rex.app. A machine heading (with New Session, or a warning when it
-//! can't be reached), a session heading with New Tab, then a row per tab with a
-//! tile, the tab's name and its working directory.
+//! can't be reached), a session heading with New Tab, then a row per tab with
+//! its name and working directory or activity.
 //!
 //! Overview changes rebuild the list from an idle callback. Terminal title
 //! changes update the existing labels in place to preserve row interaction.
@@ -221,7 +221,7 @@ pub const Sidebar = struct {
                     const focused_block_id = if (w.focused_block_id) |id| a.dupe(u8, id) catch continue else null;
                     const hay = std.fmt.allocPrint(self.gpa, "{s} {s} {s}", .{ title, detail, name }) catch continue;
                     _ = std.ascii.lowerString(hay, hay);
-                    const tab = tabRow(title, detail, activity);
+                    const tab = self.tabRow(title, detail, activity);
                     self.append(tab.row, .{
                         .kind = .tab,
                         .machine = m,
@@ -328,22 +328,10 @@ pub const Sidebar = struct {
         return row;
     }
 
-    fn tabRow(title: []const u8, detail: []const u8, activity: ov.Summary) struct { row: *gtk.ListBoxRow, title_label: *gtk.Label } {
+    fn tabRow(self: *Sidebar, title: []const u8, detail: []const u8, activity: ov.Summary) struct { row: *gtk.ListBoxRow, title_label: *gtk.Label } {
         const row = gtk.ListBoxRow.new();
         row.as(gtk.Widget).addCssClass("tab-row");
         const box = gtk.Box.new(.horizontal, 10);
-
-        const tile = gtk.Image.newFromIconName("utilities-terminal-symbolic");
-        tile.as(gtk.Widget).addCssClass("tab-tile");
-        tile.as(gtk.Widget).setValign(.center);
-        // Agents and other programs that report their status get a tile of
-        // their own.
-        if (activity.app) |app| {
-            tile.as(gtk.Widget).addCssClass("agent");
-            var tip: [128]u8 = undefined;
-            tile.as(gtk.Widget).setTooltipText(std.fmt.bufPrintSentinel(&tip, "{s}", .{app}, 0) catch "");
-        }
-        box.append(tile.as(gtk.Widget));
 
         const text = gtk.Box.new(.vertical, 0);
         text.as(gtk.Widget).setValign(.center);
@@ -363,6 +351,23 @@ pub const Sidebar = struct {
         }
         box.append(text.as(gtk.Widget));
         if (activityMark(activity.state)) |mark| box.append(mark);
+
+        const close = gtk.Button.newFromIconName("window-close-symbolic");
+        const close_widget = close.as(gtk.Widget);
+        close_widget.addCssClass("flat");
+        close_widget.addCssClass("row-close");
+        close_widget.setValign(.center);
+        close_widget.setTooltipText("Close Tab");
+        close_widget.setCanTarget(0);
+        _ = gtk.Button.signals.clicked.connect(close, *Sidebar, &onCloseTab, self, .{});
+        box.append(close_widget);
+
+        const motion = gtk.EventControllerMotion.new();
+        motion.as(gtk.EventController).setPropagationPhase(.capture);
+        _ = gtk.EventControllerMotion.signals.enter.connect(motion, *gtk.Widget, &onTabEnter, close_widget, .{});
+        _ = gtk.EventControllerMotion.signals.leave.connect(motion, *gtk.Widget, &onTabLeave, close_widget, .{});
+        row.as(gtk.Widget).addController(motion.as(gtk.EventController));
+
         row.setChild(box.as(gtk.Widget));
         return .{ .row = row, .title_label = name };
     }
@@ -403,14 +408,32 @@ pub const Sidebar = struct {
         @import("actions.zig").newSessionOn(app, m);
     }
 
+    fn buttonEntry(self: *Sidebar, button: *gtk.Button) ?Entry {
+        const box = button.as(gtk.Widget).getParent() orelse return null;
+        const widget = box.getParent() orelse return null;
+        const row = gobject.ext.cast(gtk.ListBoxRow, widget) orelse return null;
+        const index = std.math.cast(usize, row.getIndex()) orelse return null;
+        return if (index < self.entries.items.len) self.entries.items[index] else null;
+    }
+
     fn onNewTab(button: *gtk.Button, self: *Sidebar) callconv(.c) void {
-        const box = button.as(gtk.Widget).getParent() orelse return;
-        const widget = box.getParent() orelse return;
-        const row = gobject.ext.cast(gtk.ListBoxRow, widget) orelse return;
-        const index = std.math.cast(usize, row.getIndex()) orelse return;
-        if (index >= self.entries.items.len) return;
-        const entry = self.entries.items[index];
+        const entry = self.buttonEntry(button) orelse return;
         @import("actions.zig").newTabOn(self.app, entry.machine, entry.session_id);
+    }
+
+    fn onCloseTab(button: *gtk.Button, self: *Sidebar) callconv(.c) void {
+        const entry = self.buttonEntry(button) orelse return;
+        // The row can outlive its machine until the queued sidebar rebuild.
+        if (std.mem.indexOfScalar(*Machine, self.app.machines.items, entry.machine) == null) return;
+        entry.machine.closeWindow(entry.session_id, entry.window_id);
+    }
+
+    fn onTabEnter(_: *gtk.EventControllerMotion, _: f64, _: f64, close: *gtk.Widget) callconv(.c) void {
+        close.setCanTarget(1);
+    }
+
+    fn onTabLeave(_: *gtk.EventControllerMotion, close: *gtk.Widget) callconv(.c) void {
+        close.setCanTarget(0);
     }
 
     fn onRetry(_: *gtk.Button, m: *Machine) callconv(.c) void {
